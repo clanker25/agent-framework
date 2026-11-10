@@ -1,0 +1,9 @@
+{
+    "typeCheckingMode": "basic",
+    "reportMissingModuleSource": true,
+    "reportMissingTypeStubs": true,
+    "reportPrivateImportUsage": false,
+    "reportPrivateUsage": true,
+    "reportTypedDictNotRequiredAccess": false,
+    "reportInvalidTypeVarUse": false
+}

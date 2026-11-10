@@ -1,0 +1,195 @@
+﻿# Declarative Workflows
+
+Declarative Workflows is a no-code platform for orchestrating AI agents to accomplish complex, multi-step tasks with ease.
+It allows users to design, execute, and monitor workflows using simple declarative configurations—no coding required.
+By connecting multiple AI agents and services, it enables automation of sophisticated processes that traditionally require custom engineering.
+
+We've provided a set of [Sample Workflows](../../../declarative-agents/workflow-samples/) within the `agent-framework` repository.
+
+Please refer to the [README](../../../declarative-agents/workflow-samples/README.md) for setup instructions to run the sample workflows in your environment.
+
+As part of our [Getting Started with Declarative Workflows](../../samples/03-workflows/Declarative/README.md),
+we've provided a console application that is able to execute any declarative workflow.
+
+## Actions
+
+### Control-flow input validation
+
+Control-flow expressions must evaluate to non-sensitive values. This applies to
+conditions, loop items, question prompting and retry settings, approval settings,
+automatic response sending, external-loop conditions, HTTP timeouts,
+conversation-message limits and sort order, and variable-scope selection.
+Invalid inputs raise a `DeclarativeActionException`; literal defaults and
+non-sensitive expressions retain their existing behavior.
+
+Custom executors should use `EvaluateValueAsync<TValue>` for control-flow
+expressions. `EvaluateValueWithSensitivityAsync<TValue>` is intended for
+operations that preserve the returned sensitivity metadata when storing values,
+not for discarding metadata and making decisions using only `Value`.
+
+Tool actions validate automatic-send settings before dispatch and retain the
+evaluated setting for the matching response, including approval and checkpoint
+resumption. Changes to workflow state while a request is pending do not change
+that invocation's automatic-send behavior.
+Replacement MCP approvals after restoration retain the same setting while
+refreshing headers and revalidating connection names.
+For JSON checkpoints, pass `DeclarativeWorkflowJsonOptions.Default` to
+`CheckpointManager.CreateJson`; its source-generated context includes the
+per-invocation automatic-send settings.
+Function approval denials complete without evaluating automatic-send settings.
+Older approved checkpoints without a captured setting still validate the current
+setting before invoking the function.
+
+### Expression result handling
+
+Blank expression results retain their input sensitivity metadata. Evaluation
+errors in sensitive expressions, including record fields and table rows, produce
+a blank result with the same metadata so data assignments can continue.
+Diagnostic warnings identify the referenced variable names, not their values.
+Non-sensitive expression errors retain their existing exception behavior.
+`ParseValue` also assigns a blank result with the input sensitivity metadata when
+conversion of a sensitive value fails. Non-sensitive conversion failures retain
+their existing exception behavior.
+
+### Function tool approval
+
+`InvokeFunctionTool` requests approval when `requireApproval` evaluates to `true`
+or the matching function in `ResponseAgentProvider.Functions` exposes
+`ApprovalRequiredAIFunction`. Omitting `requireApproval` or setting it to `false`
+does not override the registered function's approval requirement. The workflow
+resumes the registered invocation only after a matching approval response.
+
+### MCP session lifetime
+
+`DefaultMcpToolHandler` creates a separate MCP client for every invocation,
+including `tools/list`, and disposes it before completing. The handler retains
+no per-invocation state or shared disposable resources.
+
+Standalone GET/SSE streams for unsolicited server messages are disabled because
+this handler performs request-scoped tool operations, not background subscriptions.
+SSE responses to individual tool requests remain supported.
+
+Each factory-created HTTP client is disposed with its invocation. Construct the
+handler with an application-owned `IHttpClientFactory` through
+`DefaultMcpToolHandler(IHttpClientFactory, string)`. The second
+argument is a stable named-client configuration, or `string.Empty` for the
+default configuration. Factory-created wrappers are owned by the invocation;
+the factory and its pooled handlers remain application-owned. There is no
+parameterless constructor or internally created HTTP pipeline. Configure handler
+reuse in the factory to avoid connection churn and port exhaustion.
+
+Configure the factory once in the application, not once per invocation. For
+example, with `Microsoft.Extensions.DependencyInjection`:
+
+```csharp
+services.AddHttpClient("workflow-mcp")
+    .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler
+    {
+        UseCookies = false,
+        AllowAutoRedirect = false,
+        CheckCertificateRevocationList = true
+    })
+    .SetHandlerLifetime(TimeSpan.FromMinutes(2));
+
+services.AddSingleton<IMcpToolHandler>(serviceProvider => new DefaultMcpToolHandler(
+    serviceProvider.GetRequiredService<IHttpClientFactory>(), "workflow-mcp"));
+```
+
+Factory clients use the application's transport-policy configuration.
+Restrict credential-injecting handlers to the configured server origin.
+Do not store per-workflow credentials, cookies, or
+mutable origin policy in pooled handlers. Use a bounded set of configuration
+names, not workflow IDs, credentials, or arbitrary URLs. A finite factory handler
+lifetime lets subsequent invocations refresh connections without interrupting
+active calls. Streamable HTTP remains enforced.
+
+`ProtocolVersion` defaults to `null`, preserving the MCP SDK's automatic protocol
+discovery and legacy fallback. If the server's supported protocol is known, set
+the init-only property when constructing the handler:
+
+```csharp
+DefaultMcpToolHandler handler = new(httpClientFactory, "workflow-mcp")
+{
+    ProtocolVersion = "2025-11-25"
+};
+```
+
+An explicit legacy version skips the discovery probe, including its possible
+timeout, but still initializes and disposes a separate session for every call.
+The server must negotiate that exact legacy version. Explicit newer revisions
+still perform discovery and do not downgrade to a legacy-only server.
+Incompatible selections fail rather than silently reverting to automatic
+negotiation. Use separately configured handlers for differing server protocol
+policies; do not pin a version without knowing the server supports it.
+
+The handler is not disposable. The workflow host owns admission limits,
+invocation deadlines, and shutdown cancellation. Bound concurrent work and pass
+a cancellation token covering the whole invocation; cancel and await those calls
+before disposing the application's HTTP factory infrastructure or service provider.
+Non-cancellation session and transport cleanup failures are reported through
+`System.Diagnostics.Trace` warnings and do not replace a tool result or its
+original error.
+
+Parameterless construction, the callback-based constructor, and handler-level
+`DisposeAsync`/`IAsyncDisposable` are not supported. Migrate default construction
+and callback authentication to application-owned named factory
+clients and origin-bound delegating handlers; every factory call must return a
+fresh HTTP client wrapper owned by the invocation, not a borrowed shared client.
+Remove handler `await using`/disposal calls and await active invocations in the host.
+
+This also changes the previous default behavior, which retained initialized MCP
+clients across calls. Calls now incur any protocol session setup per invocation
+and do not preserve implicit server-side session state between calls, including
+across approval waits or checkpoint resumes. Keep durable workflow state in
+workflow variables/checkpoints and pass explicit remote state handles as tool
+arguments where supported. Applications requiring session continuity should
+implement `IMcpToolHandler` with an explicit authentication ownership and session
+lifetime contract. HTTP connection pooling does not provide MCP session continuity.
+
+### ⚙️ Foundry Actions
+
+|Action|Description|
+|-|-|
+|**AddConversationMessage**|Adds a message to the current conversation thread. Useful for dynamically appending information or system responses.
+|**CopyConversationMessages**|Duplicates messages from one conversation or context to another. Helps maintain continuity across related interactions.
+|**CreateConversation**|Starts a new conversation instance. Used when initiating separate dialogues or workflows.
+|**DeleteConversation**|Permanently removes an existing conversation. Helps manage storage and ensure privacy compliance.
+|**InvokeAzureAgent**|Triggers an Azure-based AI agent to perform a task or return a response. Useful for leveraging external cognitive services.
+|**RetrieveConversationMessage**|Fetches a single message from a conversation history. Enables referencing or reusing specific past exchanges.
+|**RetrieveConversationMessages**|Retrieves multiple messages from the conversation history. Useful for context reconstruction or auditing.
+
+### 🧑‍💼 Human Input
+
+|Action|Description|
+|-|-|
+|**Question**|Presents a query or prompt requiring human input. Integrates human decision-making into automated processes.
+
+### 🧩 State Management
+
+Variable names are case-sensitive, matching Power Fx record fields. Differently
+cased names retain independent values and metadata, including after checkpoint
+restoration.
+
+|Action|Description|
+|-|-|
+|**ClearAllVariables**|Resets all variables in the current context. Ensures a clean state before starting new logic or sessions.
+|**EditTableV2**|Modifies data in a structured table format. Useful for updating variable sets or configuration data dynamically.
+|**ParseValue**|Extracts or converts data into a usable format. Often used for transforming input before assignment or evaluation.
+|**ResetVariable**|Restores a specific variable to its default or initial value. Helps maintain predictable state transitions.
+|**SendActivity**|Sends an activity or message to another system or user. Facilitates communication between components or external services.
+|**SetMultipleVariables**|Assigns values to multiple variables simultaneously. Useful for batch initialization or updates.
+|**SetTextVariable**|Assigns text-based data to a variable. Commonly used for string operations or message composition.
+|**SetVariable**|Sets or updates the value of a single variable. Fundamental for maintaining and controlling state within workflows.
+
+### 🧭 Control Flow
+
+|Action|Description|
+|-|-|
+|**BreakLoop**|Exits the current loop prematurely when a specified condition is met. Useful for preventing unnecessary iterations once a goal is achieved.
+|**ConditionGroup**|Defines a set of conditional statements that can be evaluated together. It allows complex decision logic to be grouped for readability and maintainability.
+|**ConditionItem**|Represents a single conditional statement within a group. It evaluates a specific logical condition and determines the next step in the flow.
+|**ContinueLoop**|Skips the remaining steps in the current iteration and continues with the next loop cycle. Commonly used to bypass specific cases without exiting the loop entirely.
+|**EndConversation**|Terminates the current conversation session. It ensures any necessary cleanup or final actions are performed before closing.
+|**EndWorkflow**|Ends the current workflow or sub-workflow within a broader conversation flow. This helps modularize complex interactions.
+|**Foreach**|Iterates through a collection of items, executing a set of actions for each. Ideal for processing lists or batch operations.
+|**GotoAction**|Jumps directly to a specified action within the workflow. Enables non-linear navigation in the logic flow.

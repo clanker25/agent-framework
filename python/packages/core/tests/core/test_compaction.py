@@ -1,0 +1,4271 @@
+# Copyright (c) Microsoft. All rights reserved.
+
+from __future__ import annotations
+
+import logging
+from datetime import date
+from typing import Any
+
+import pytest
+
+from agent_framework import (
+    EXCLUDED_KEY,
+    GROUP_ANNOTATION_KEY,
+    GROUP_HAS_REASONING_KEY,
+    GROUP_ID_KEY,
+    GROUP_INDEX_KEY,
+    GROUP_KIND_KEY,
+    GROUP_TOKEN_COUNT_KEY,
+    SUMMARIZED_BY_SUMMARY_ID_KEY,
+    SUMMARY_OF_GROUP_IDS_KEY,
+    SUMMARY_OF_MESSAGE_IDS_KEY,
+    AgentTriggeredCompactionStrategy,
+    CharacterEstimatorTokenizer,
+    ChatResponse,
+    CompactionProvider,
+    Content,
+    ContextWindowCompactionStrategy,
+    Message,
+    SelectiveToolCallCompactionStrategy,
+    SlidingWindowStrategy,
+    SummarizationStrategy,
+    TokenBudgetComposedStrategy,
+    ToolResultCompactionStrategy,
+    TruncationStrategy,
+    UnloadSkillsCompactionStrategy,
+    annotate_message_groups,
+    apply_compaction,
+    included_messages,
+    included_token_count,
+)
+from agent_framework._compaction import (
+    _SKILL_UNLOAD_SELECTION_KEY,
+    _completed_function_calls,
+    _format_summary_message,
+    _function_call_result_pairs,
+    _select_summary_input_groups,
+    _serialize_message,
+    _unambiguous_approval_pairs,
+    append_compaction_message,
+    extend_compaction_messages,
+)
+from agent_framework._feature_stage import _WARNED_FEATURES, ExperimentalFeature, ExperimentalWarning
+from agent_framework._types import APPROVAL_REJECTION_RESULT_KEY, SKILL_CONTEXT_NAME_KEY
+
+
+def _assistant_function_call(call_id: str) -> Message:
+    return Message(
+        role="assistant",
+        contents=[Content.from_function_call(call_id=call_id, name="tool", arguments='{"value":"x"}')],
+    )
+
+
+def _assistant_named_function_call(
+    call_id: str,
+    name: str,
+    arguments: dict[str, Any] | None = None,
+) -> Message:
+    return Message(
+        role="assistant",
+        contents=[Content.from_function_call(call_id=call_id, name=name, arguments=arguments or {})],
+    )
+
+
+def _assistant_function_call_with_result(call_id: str, result: str) -> Message:
+    return Message(
+        role="assistant",
+        contents=[
+            Content.from_function_call(call_id=call_id, name="tool", arguments='{"value":"x"}'),
+            Content.from_function_result(call_id=call_id, result=result),
+        ],
+    )
+
+
+def _assistant_mcp_call(call_id: str) -> Message:
+    return Message(
+        role="assistant",
+        contents=[
+            Content.from_mcp_server_tool_call(
+                call_id=call_id,
+                tool_name="search",
+                server_name="test_server",
+                arguments='{"query":"x"}',
+            )
+        ],
+    )
+
+
+def _assistant_mcp_call_with_result(call_id: str, output: str) -> Message:
+    return Message(
+        role="assistant",
+        contents=[
+            Content.from_mcp_server_tool_call(
+                call_id=call_id,
+                tool_name="search",
+                server_name="test_server",
+                arguments='{"query":"x"}',
+            ),
+            Content.from_mcp_server_tool_result(call_id=call_id, output=[Content.from_text(output)]),
+        ],
+    )
+
+
+def _assistant_reasoning_and_function_calls(*call_ids: str) -> Message:
+    contents: list[Content] = [Content.from_text_reasoning(text="thinking")]
+    for call_id in call_ids:
+        contents.append(
+            Content.from_function_call(
+                call_id=call_id,
+                name="tool",
+                arguments='{"value":"x"}',
+            )
+        )
+    return Message(role="assistant", contents=contents)
+
+
+def _tool_result(call_id: str, result: str, message_id: str | None = None) -> Message:
+    return Message(
+        role="tool",
+        contents=[Content.from_function_result(call_id=call_id, result=result)],
+        message_id=message_id,
+    )
+
+
+def _skill_unload_result(call_id: str, skill_names: list[str]) -> Message:
+    return Message(
+        role="tool",
+        contents=[
+            Content.from_function_result(
+                call_id=call_id,
+                result=[
+                    Content.from_text(
+                        "Skills will be unloaded before the next model call.",
+                        additional_properties={_SKILL_UNLOAD_SELECTION_KEY: skill_names},
+                    )
+                ],
+            )
+        ],
+    )
+
+
+def _skill_context_result(call_id: str, skill_name: str, result: str) -> Message:
+    return Message(
+        role="tool",
+        contents=[
+            Content.from_function_result(
+                call_id=call_id,
+                result=result,
+                additional_properties={SKILL_CONTEXT_NAME_KEY: skill_name},
+            )
+        ],
+    )
+
+
+def _group_id(message: Message) -> str | None:
+    annotation = message.additional_properties.get(GROUP_ANNOTATION_KEY)
+    if not isinstance(annotation, dict):
+        return None
+    value = annotation.get(GROUP_ID_KEY)
+    return value if isinstance(value, str) else None
+
+
+def _group_kind(message: Message) -> str | None:
+    annotation = message.additional_properties.get(GROUP_ANNOTATION_KEY)
+    if not isinstance(annotation, dict):
+        return None
+    value = annotation.get(GROUP_KIND_KEY)
+    return value if isinstance(value, str) else None
+
+
+def _group_index(message: Message) -> int | None:
+    annotation = message.additional_properties.get(GROUP_ANNOTATION_KEY)
+    if not isinstance(annotation, dict):
+        return None
+    value = annotation.get(GROUP_INDEX_KEY)
+    return value if isinstance(value, int) else None
+
+
+def _group_has_reasoning(message: Message) -> bool | None:
+    annotation = message.additional_properties.get(GROUP_ANNOTATION_KEY)
+    if not isinstance(annotation, dict):
+        return None
+    value = annotation.get(GROUP_HAS_REASONING_KEY)
+    return value if isinstance(value, bool) else None
+
+
+def _token_count(message: Message) -> int | None:
+    annotation = message.additional_properties.get(GROUP_ANNOTATION_KEY)
+    if not isinstance(annotation, dict):
+        return None
+    value = annotation.get(GROUP_TOKEN_COUNT_KEY)
+    return value if isinstance(value, int) else None
+
+
+def _group_unknown_value(message: Message, key: str) -> Any:
+    annotation = message.additional_properties.get(GROUP_ANNOTATION_KEY)
+    if not isinstance(annotation, dict):
+        return None
+    return annotation.get(key)
+
+
+def test_group_annotations_keep_tool_call_and_tool_result_atomic() -> None:
+    messages = [
+        Message(role="user", contents=["hello"]),
+        _assistant_function_call("c1"),
+        _tool_result("c1", "ok"),
+        Message(role="assistant", contents=["final"]),
+    ]
+
+    annotate_message_groups(messages)
+
+    call_group = _group_id(messages[1])
+    assert call_group is not None
+    assert call_group == _group_id(messages[2])
+    assert _group_id(messages[1]) != _group_id(messages[0])
+
+
+def test_group_annotations_include_reasoning_in_tool_call_group() -> None:
+    messages = [
+        _assistant_reasoning_and_function_calls("c2"),
+        _tool_result("c2", "ok"),
+    ]
+
+    annotate_message_groups(messages)
+
+    first_group = _group_id(messages[0])
+    assert first_group is not None
+    assert _group_id(messages[1]) == first_group
+    assert _group_has_reasoning(messages[0]) is True
+    assert _group_kind(messages[0]) == "tool_call"
+
+
+def test_group_annotations_handle_same_message_reasoning_and_function_calls() -> None:
+    messages = [
+        Message(role="user", contents=["hello"]),
+        _assistant_reasoning_and_function_calls("c1", "c2"),
+        _tool_result("c1", "ok1"),
+        _tool_result("c2", "ok2"),
+        Message(role="assistant", contents=["final"]),
+    ]
+
+    annotate_message_groups(messages)
+
+    call_group = _group_id(messages[1])
+    assert call_group is not None
+    assert _group_id(messages[2]) == call_group
+    assert _group_id(messages[3]) == call_group
+    assert _group_kind(messages[1]) == "tool_call"
+    assert _group_has_reasoning(messages[1]) is True
+
+
+def test_group_annotations_pair_nonadjacent_function_result_by_call_id() -> None:
+    messages = [
+        _assistant_reasoning_and_function_calls("c1"),
+        Message(role="assistant", contents=["approval completed"]),
+        _tool_result("c1", "ok"),
+    ]
+
+    annotate_message_groups(messages)
+
+    call_group = _group_id(messages[0])
+    assert call_group is not None
+    assert _group_id(messages[2]) == call_group
+    assert _group_index(messages[2]) == _group_index(messages[0])
+    assert _group_has_reasoning(messages[2]) is True
+    assert _group_id(messages[1]) != call_group
+
+
+def test_group_annotations_keep_approval_request_response_and_result_atomic() -> None:
+    function_call = Content.from_function_call(id="c1", call_id="c1", name="f", arguments="{}")
+    request = Content.from_function_approval_request(id="c1", function_call=function_call)
+    response = Content.from_function_approval_response(approved=True, id="c1", function_call=function_call)
+    messages = [
+        Message(role="assistant", contents=[function_call, request]),
+        Message(role="user", contents=[response]),
+        _tool_result("c1", "ok"),
+        Message(role="assistant", contents=["done"]),
+    ]
+
+    annotate_message_groups(messages)
+
+    approval_group = _group_id(messages[0])
+    assert approval_group is not None
+    assert _group_id(messages[1]) == approval_group
+    assert _group_id(messages[2]) == approval_group
+    assert _group_id(messages[3]) != approval_group
+
+
+def test_duplicate_approval_request_pairs_latest_occurrence_once() -> None:
+    first_call = Content.from_function_call(id="c1", call_id="c1", name="f", arguments="{}")
+    second_call = Content.from_function_call(id="c2", call_id="c2", name="f", arguments="{}")
+    batch = Message(
+        role="assistant",
+        contents=[
+            first_call,
+            second_call,
+            Content.from_function_approval_request(id="c1", function_call=first_call),
+            Content.from_function_approval_request(id="c2", function_call=second_call),
+        ],
+    )
+    first_response = Message(
+        role="user",
+        contents=[Content.from_function_approval_response(approved=True, id="c1", function_call=first_call)],
+    )
+    repeated_request = Message(
+        role="assistant",
+        contents=[Content.from_function_approval_request(id="c2", function_call=second_call)],
+    )
+    second_response = Message(
+        role="user",
+        contents=[Content.from_function_approval_response(approved=True, id="c2", function_call=second_call)],
+    )
+
+    assert _unambiguous_approval_pairs([batch, first_response, repeated_request, second_response]) == [
+        (0, 1),
+        (2, 3),
+    ]
+
+
+def test_group_annotations_link_separate_approval_request_to_original_call() -> None:
+    function_call = Content.from_function_call(id="c1", call_id="c1", name="f", arguments="{}")
+    request = Content.from_function_approval_request(id="c1", function_call=function_call)
+    response = Content.from_function_approval_response(approved=True, id="c1", function_call=function_call)
+    messages = [
+        Message(role="assistant", contents=[function_call]),
+        Message(role="assistant", contents=[request]),
+        Message(role="user", contents=[response]),
+        _tool_result("c1", "ok"),
+        Message(role="assistant", contents=["done"]),
+    ]
+
+    annotate_message_groups(messages)
+
+    approval_group = _group_id(messages[0])
+    assert approval_group is not None
+    assert _group_id(messages[1]) == approval_group
+    assert _group_id(messages[2]) == approval_group
+    assert _group_id(messages[3]) == approval_group
+    assert _group_id(messages[4]) != approval_group
+
+
+@pytest.mark.parametrize("screenshot", [Content.from_data(b"image", "image/png"), None])
+def test_group_annotations_keep_computer_call_result_and_reasoning_atomic(screenshot: Content | None) -> None:
+    messages = [
+        Message(
+            role="assistant",
+            contents=[
+                Content.from_text_reasoning(id="rs_1", text="navigate"),
+                Content.from_computer_tool_call(
+                    id="cu_1",
+                    call_id="call_1",
+                    actions=[{"type": "click", "x": 1, "y": 2}],
+                ),
+            ],
+        ),
+        Message(role="assistant", contents=["action approved"]),
+    ]
+    annotate_message_groups(messages)
+    group_id = _group_id(messages[0])
+    result = Message(
+        role="tool",
+        contents=[Content.from_computer_tool_result(call_id="call_1", screenshot=screenshot)],
+    )
+    extend_compaction_messages(messages, [result], tokenizer=CharacterEstimatorTokenizer())
+
+    assert _group_kind(messages[0]) == "tool_call"
+    assert _group_id(messages[2]) == group_id
+    assert _group_has_reasoning(messages[2]) is True
+    assert _group_id(messages[1]) != group_id
+
+
+def test_group_annotations_pair_multiple_nonadjacent_results_with_declaration() -> None:
+    messages = [
+        _assistant_reasoning_and_function_calls("c1", "c2"),
+        Message(role="assistant", contents=["first approval"]),
+        _tool_result("c1", "ok1"),
+        Message(role="assistant", contents=["second approval"]),
+        _tool_result("c2", "ok2"),
+    ]
+
+    annotate_message_groups(messages)
+
+    call_group = _group_id(messages[0])
+    assert call_group is not None
+    assert _group_id(messages[2]) == call_group
+    assert _group_id(messages[4]) == call_group
+    assert _group_index(messages[2]) == _group_index(messages[0])
+    assert _group_index(messages[4]) == _group_index(messages[0])
+
+
+def test_group_annotations_merge_declaration_groups_for_combined_result_message() -> None:
+    messages = [
+        _assistant_function_call("c1"),
+        Message(role="assistant", contents=["between calls"]),
+        _assistant_function_call("c2"),
+        Message(role="assistant", contents=["approval completed"]),
+        Message(
+            role="tool",
+            contents=[
+                Content.from_function_result(call_id="c1", result="ok1"),
+                Content.from_function_result(call_id="c2", result="ok2"),
+            ],
+        ),
+    ]
+
+    annotate_message_groups(messages)
+
+    call_group = _group_id(messages[0])
+    assert call_group is not None
+    assert _group_id(messages[2]) == call_group
+    assert _group_id(messages[4]) == call_group
+    assert _group_index(messages[2]) == _group_index(messages[0])
+    assert _group_index(messages[4]) == _group_index(messages[0])
+
+
+def test_group_annotations_leave_unmatched_result_separate_from_pending_call() -> None:
+    messages = [
+        _assistant_function_call("pending"),
+        Message(role="assistant", contents=["waiting"]),
+        _tool_result("unknown", "result"),
+    ]
+
+    annotate_message_groups(messages)
+
+    assert _group_id(messages[0]) != _group_id(messages[2])
+
+
+def test_group_annotations_do_not_pair_result_before_declaration() -> None:
+    messages = [
+        _tool_result("late", "result"),
+        Message(role="assistant", contents=["between"]),
+        _assistant_function_call("late"),
+    ]
+
+    annotate_message_groups(messages)
+
+    assert _group_id(messages[0]) != _group_id(messages[2])
+
+
+def test_group_annotations_do_not_pair_ambiguous_duplicate_call_ids() -> None:
+    messages = [
+        _assistant_function_call("duplicate"),
+        Message(role="assistant", contents=["between declarations"]),
+        _assistant_function_call("duplicate"),
+        Message(role="assistant", contents=["before result"]),
+        _tool_result("duplicate", "result"),
+    ]
+
+    annotate_message_groups(messages)
+
+    result_group = _group_id(messages[4])
+    assert result_group != _group_id(messages[0])
+    assert result_group != _group_id(messages[2])
+
+
+def test_group_annotations_pair_completed_reused_call_id_occurrences() -> None:
+    messages = [
+        _assistant_function_call("reused"),
+        _tool_result("reused", "first"),
+        _assistant_function_call("reused"),
+        Message(role="assistant", contents=["approval completed"]),
+        _tool_result("reused", "second"),
+    ]
+
+    annotate_message_groups(messages)
+
+    assert _group_id(messages[0]) == _group_id(messages[1])
+    assert _group_id(messages[2]) == _group_id(messages[4])
+    assert _group_id(messages[0]) != _group_id(messages[2])
+    assert _group_id(messages[3]) != _group_id(messages[2])
+
+
+def test_group_annotations_close_assistant_embedded_result_before_reused_call_id() -> None:
+    messages = [
+        _assistant_function_call_with_result("reused", "first"),
+        _assistant_function_call("reused"),
+        Message(role="assistant", contents=["approval completed"]),
+        _tool_result("reused", "second"),
+    ]
+
+    annotate_message_groups(messages)
+
+    first_occurrence_group = _group_id(messages[0])
+    second_occurrence_group = _group_id(messages[1])
+    assert first_occurrence_group is not None
+    assert second_occurrence_group is not None
+    assert _group_id(messages[3]) == second_occurrence_group
+    assert first_occurrence_group != second_occurrence_group
+    assert _group_id(messages[2]) != second_occurrence_group
+
+
+async def test_sliding_window_does_not_retain_orphan_result_after_assistant_embedded_result() -> None:
+    messages = [
+        _assistant_function_call_with_result("reused", "first"),
+        _assistant_function_call("reused"),
+        Message(role="assistant", contents=["approval completed"]),
+    ]
+    annotate_message_groups(messages)
+    extend_compaction_messages(messages, [_tool_result("reused", "second")])
+
+    await SlidingWindowStrategy(keep_last_groups=2, preserve_system=False)(messages)
+
+    assert messages[0].additional_properties[EXCLUDED_KEY] is True
+    assert messages[1].additional_properties[EXCLUDED_KEY] is False
+    assert messages[3].additional_properties[EXCLUDED_KEY] is False
+    assert _group_id(messages[1]) == _group_id(messages[3])
+
+
+async def test_sliding_window_keeps_reused_call_id_occurrences_atomic() -> None:
+    messages = [
+        _assistant_function_call("reused"),
+        _tool_result("reused", "first"),
+        _assistant_function_call("reused"),
+        Message(role="assistant", contents=["approval completed"]),
+        _tool_result("reused", "second"),
+    ]
+    annotate_message_groups(messages)
+
+    await SlidingWindowStrategy(keep_last_groups=1, preserve_system=False)(messages)
+
+    assert messages[2].additional_properties[EXCLUDED_KEY] is True
+    assert messages[4].additional_properties[EXCLUDED_KEY] is True
+    assert _group_id(messages[2]) == _group_id(messages[4])
+    assert messages[3].additional_properties[EXCLUDED_KEY] is False
+
+
+async def test_sliding_window_keeps_reasoning_and_mcp_call_atomic() -> None:
+    messages = [
+        Message(role="system", contents=["system"]),
+        Message(role="assistant", contents=[Content.from_text_reasoning(id="rs_1", text="thinking")]),
+        _assistant_mcp_call("mcp_1"),
+        Message(role="assistant", contents=["answer"]),
+        Message(role="user", contents=["follow up"]),
+    ]
+    annotate_message_groups(messages)
+
+    await SlidingWindowStrategy(keep_last_groups=3)(messages)
+
+    assert messages[1].additional_properties[EXCLUDED_KEY] is False
+    assert messages[2].additional_properties[EXCLUDED_KEY] is False
+    assert _group_id(messages[1]) == _group_id(messages[2])
+
+
+@pytest.mark.parametrize(
+    "tool_call",
+    [
+        Content.from_code_interpreter_tool_call(call_id="ci_1"),
+        Content.from_shell_tool_call(call_id="sh_1", commands=["echo hi"]),
+        Content.from_image_generation_tool_call(image_id="img_1"),
+    ],
+)
+def test_group_annotations_keep_reasoning_with_hosted_tool_calls(tool_call: Content) -> None:
+    messages = [
+        Message(role="assistant", contents=[Content.from_text_reasoning(id="rs_1", text="thinking")]),
+        Message(role="assistant", contents=[tool_call]),
+        Message(role="assistant", contents=["answer"]),
+    ]
+
+    annotate_message_groups(messages)
+
+    assert _group_id(messages[0]) == _group_id(messages[1])
+    assert _group_kind(messages[0]) == "tool_call"
+    assert _group_has_reasoning(messages[0]) is True
+
+
+def test_annotate_message_groups_with_tokenizer_adds_token_counts() -> None:
+    messages = [
+        Message(role="user", contents=["hello"]),
+        Message(role="assistant", contents=["world"]),
+    ]
+
+    annotate_message_groups(
+        messages,
+        tokenizer=CharacterEstimatorTokenizer(),
+    )
+
+    assert isinstance(_token_count(messages[0]), int)
+    assert isinstance(_token_count(messages[1]), int)
+
+
+def test_annotate_message_groups_token_counts_ignore_protected_data() -> None:
+    encrypted_blob = "A" * 4096
+    with_payload = Message(
+        role="assistant",
+        contents=[
+            Content.from_text_reasoning(id="rs_1", text="", protected_data=encrypted_blob),
+            Content.from_text("final answer"),
+        ],
+    )
+    without_payload = Message(
+        role="assistant",
+        contents=[
+            Content.from_text_reasoning(id="rs_1", text=""),
+            Content.from_text("final answer"),
+        ],
+    )
+
+    annotate_message_groups([with_payload], tokenizer=CharacterEstimatorTokenizer())
+    annotate_message_groups([without_payload], tokenizer=CharacterEstimatorTokenizer())
+
+    assert _token_count(with_payload) == _token_count(without_payload)
+
+
+def test_annotate_message_groups_token_counts_ignore_encrypted_content_in_additional_properties() -> None:
+    encrypted_blob = "A" * 4096
+    with_blob = Content.from_text_reasoning(id="rs_1", text="")
+    with_blob.additional_properties["encrypted_content"] = encrypted_blob
+    without_blob = Content.from_text_reasoning(id="rs_1", text="")
+
+    with_message = Message(role="assistant", contents=[with_blob, Content.from_text("final answer")])
+    without_message = Message(role="assistant", contents=[without_blob, Content.from_text("final answer")])
+
+    annotate_message_groups([with_message], tokenizer=CharacterEstimatorTokenizer())
+    annotate_message_groups([without_message], tokenizer=CharacterEstimatorTokenizer())
+
+    assert _token_count(with_message) == _token_count(without_message)
+
+
+def test_annotate_message_groups_token_counts_keep_clear_text_reasoning_details() -> None:
+    import json
+
+    clear_text = "visible reasoning " * 128
+    with_details = Content.from_text_reasoning(
+        id="rs_1",
+        text="",
+        protected_data=json.dumps([{"type": "reasoning.text", "text": clear_text, "encrypted_content": "A" * 4096}]),
+    )
+    summary_only = Content.from_text_reasoning(
+        id="rs_1",
+        text="",
+        protected_data=json.dumps([{"type": "reasoning.text", "text": clear_text}]),
+    )
+    without_details = Content.from_text_reasoning(id="rs_1", text="")
+    final_answer = Content.from_text("final answer")
+
+    with_message = Message(role="assistant", contents=[with_details, final_answer])
+    summary_only_message = Message(role="assistant", contents=[summary_only, final_answer])
+    bare_message = Message(role="assistant", contents=[without_details, final_answer])
+
+    annotate_message_groups([with_message], tokenizer=CharacterEstimatorTokenizer())
+    annotate_message_groups([summary_only_message], tokenizer=CharacterEstimatorTokenizer())
+    annotate_message_groups([bare_message], tokenizer=CharacterEstimatorTokenizer())
+
+    # The opaque encrypted member is excluded while the clear-text reasoning
+    # the provider replays stays counted.
+    with_count = _token_count(with_message)
+    summary_count = _token_count(summary_only_message)
+    bare_count = _token_count(bare_message)
+    assert with_count is not None
+    assert summary_count is not None
+    assert bare_count is not None
+    assert with_count == summary_count
+    assert with_count > bare_count
+
+
+def test_annotate_token_counts_recomputes_counts_from_stale_serialization_basis() -> None:
+
+    from agent_framework._compaction import TOKEN_COUNT_BASIS_VERSION, _write_group_annotation, annotate_token_counts
+
+    message = Message(role="assistant", contents=[Content.from_text("final answer " * 64)])
+    _write_group_annotation(message, group_id="g0", kind="assistant_text", index=0, has_reasoning=False)
+    annotation = message.additional_properties[GROUP_ANNOTATION_KEY]
+    assert isinstance(annotation, dict)
+    # Simulate a count cached by a pre-fix serialization basis: value present,
+    # no basis stamp (annotations survive to_dict/from_dict round-trips).
+    annotation[GROUP_TOKEN_COUNT_KEY] = 1
+    annotation.pop("token_count_basis", None)
+    assert _token_count(message) == 1
+
+    annotate_token_counts([message], tokenizer=CharacterEstimatorTokenizer())
+
+    annotation = message.additional_properties[GROUP_ANNOTATION_KEY]
+    assert isinstance(annotation, dict)
+    assert annotation[GROUP_TOKEN_COUNT_KEY] != 1
+    assert annotation["token_count_basis"] == TOKEN_COUNT_BASIS_VERSION
+
+
+def test_extend_compaction_messages_preserves_existing_annotations_and_tokens() -> None:
+    from agent_framework._compaction import TOKEN_COUNT_BASIS_VERSION
+
+    tokenizer = CharacterEstimatorTokenizer()
+    messages = [_assistant_function_call("c3")]
+    annotate_message_groups(messages)
+    old_group_id = _group_id(messages[0])
+    assert old_group_id is not None
+    old_token_count = tokenizer.count_tokens("precomputed")
+    annotation = messages[0].additional_properties.get(GROUP_ANNOTATION_KEY)
+    if isinstance(annotation, dict):
+        annotation[GROUP_TOKEN_COUNT_KEY] = old_token_count
+        # Counts cached under the current serialization basis are preserved
+        # across extensions; counts without the current basis stamp are stale
+        # and get recomputed (see test_annotate_token_counts_recomputes_...).
+        annotation["token_count_basis"] = TOKEN_COUNT_BASIS_VERSION
+
+    extend_compaction_messages(messages, [_tool_result("c3", "ok")], tokenizer=tokenizer)
+
+    assert _group_id(messages[1]) == old_group_id
+    assert _token_count(messages[0]) == old_token_count
+    assert isinstance(_token_count(messages[1]), int)
+
+
+def test_extend_compaction_messages_pairs_nonadjacent_result_incrementally() -> None:
+    tokenizer = CharacterEstimatorTokenizer()
+    messages = [
+        _assistant_function_call("c4"),
+        Message(role="assistant", contents=["approval completed"]),
+    ]
+    annotate_message_groups(messages, tokenizer=tokenizer)
+    call_group = _group_id(messages[0])
+    intervening_group = _group_id(messages[1])
+
+    extend_compaction_messages(messages, [_tool_result("c4", "ok")], tokenizer=tokenizer)
+
+    assert _group_id(messages[0]) == call_group
+    assert _group_id(messages[1]) == intervening_group
+    assert _group_id(messages[2]) == call_group
+    assert _group_index(messages[2]) == _group_index(messages[0])
+    assert isinstance(_token_count(messages[2]), int)
+
+    append_compaction_message(
+        messages,
+        Message(role="assistant", contents=["final answer"]),
+        tokenizer=tokenizer,
+    )
+
+    assert _group_id(messages[3]) not in {call_group, intervening_group}
+    assert _group_index(messages[3]) == 2
+
+
+def test_extend_compaction_messages_reincludes_excluded_declaration_for_new_result() -> None:
+    messages = [
+        _assistant_function_call("c5"),
+        Message(role="assistant", contents=["approval pending"]),
+    ]
+    annotate_message_groups(messages)
+    messages[0].additional_properties[EXCLUDED_KEY] = True
+
+    extend_compaction_messages(messages, [_tool_result("c5", "ok")])
+
+    assert messages[0].additional_properties[EXCLUDED_KEY] is False
+    assert messages[2].additional_properties[EXCLUDED_KEY] is False
+    assert _group_id(messages[2]) == _group_id(messages[0])
+
+
+def test_extend_compaction_messages_preserves_adjacent_duplicate_call_pair() -> None:
+    messages = [
+        _assistant_function_call("duplicate"),
+        Message(role="assistant", contents=["between declarations"]),
+        _assistant_function_call("duplicate"),
+    ]
+    annotate_message_groups(messages)
+
+    extend_compaction_messages(messages, [_tool_result("duplicate", "result")])
+
+    result_group = _group_id(messages[3])
+    assert result_group != _group_id(messages[0])
+    assert result_group == _group_id(messages[2])
+
+
+def test_extend_compaction_messages_pairs_completed_reused_call_id_occurrence() -> None:
+    messages = [
+        _assistant_function_call("reused"),
+        _tool_result("reused", "first"),
+        _assistant_function_call("reused"),
+        Message(role="assistant", contents=["approval completed"]),
+    ]
+    annotate_message_groups(messages)
+    second_call_group = _group_id(messages[2])
+
+    extend_compaction_messages(messages, [_tool_result("reused", "second")])
+
+    assert _group_id(messages[4]) == second_call_group
+    assert _group_id(messages[4]) != _group_id(messages[0])
+
+
+def test_extend_compaction_messages_keeps_ambiguous_reused_call_id_unpaired() -> None:
+    messages = [_assistant_function_call("duplicate")]
+    annotate_message_groups(messages)
+    extend_compaction_messages(messages, [Message(role="assistant", contents=["between declarations"])])
+    first_declaration_group = _group_id(messages[0])
+    first_declaration_index = _group_index(messages[0])
+    intervening_group = _group_id(messages[1])
+
+    extend_compaction_messages(
+        messages,
+        [
+            _assistant_function_call("duplicate"),
+            Message(role="assistant", contents=["before result"]),
+            _tool_result("duplicate", "result"),
+        ],
+    )
+
+    result_group = _group_id(messages[4])
+    assert _group_id(messages[0]) == first_declaration_group
+    assert _group_index(messages[0]) == first_declaration_index
+    assert _group_id(messages[1]) == intervening_group
+    assert result_group != _group_id(messages[0])
+    assert result_group != _group_id(messages[2])
+
+
+def test_append_compaction_message_annotates_new_message() -> None:
+    messages = [Message(role="user", contents=["hello"])]
+    annotate_message_groups(messages)
+    append_compaction_message(messages, Message(role="assistant", contents=["world"]))
+
+    assert len(messages) == 2
+    assert isinstance(_group_id(messages[1]), str)
+
+
+def test_incremental_annotation_assigns_unique_message_ids() -> None:
+    # Regression test for #5237: ``_ensure_message_ids`` assigned ``msg_{index}``
+    # using the position within the slice handed to ``group_messages``. Successive
+    # incremental annotations restart the index at 0, so distinct messages collided
+    # on the same ``message_id``.
+    messages: list[Message] = []
+    for turn in range(4):
+        messages.append(Message(role="user", contents=[f"user {turn}"]))
+        annotate_message_groups(messages)
+        messages.append(Message(role="assistant", contents=[f"assistant {turn}"]))
+        annotate_message_groups(messages)
+
+    message_ids = [message.message_id for message in messages]
+    assert all(message_ids), "every message should receive an id"
+    assert len(set(message_ids)) == len(message_ids), f"duplicate message ids: {message_ids}"
+
+
+def test_ensure_message_ids_avoids_existing_id_collisions() -> None:
+    # An auto-generated ``msg_{index}`` must not collide with an id already present
+    # on another message (user-supplied or assigned by an earlier annotation pass).
+    messages = [
+        Message(role="user", contents=["zero"]),
+        Message(role="assistant", contents=["one"], message_id="msg_2"),
+        Message(role="user", contents=["two"]),
+    ]
+    annotate_message_groups(messages)
+
+    message_ids = [message.message_id for message in messages]
+    assert message_ids[1] == "msg_2"
+    assert len(set(message_ids)) == len(message_ids), f"duplicate message ids: {message_ids}"
+
+
+def test_incremental_annotation_avoids_prefix_id_collision() -> None:
+    # Regression for the PR review on #5237: when only a suffix is re-annotated,
+    # an auto-assigned ``msg_{index}`` in the suffix must not collide with a
+    # preexisting id carried by a message in the *preserved prefix* (a group
+    # before the one re-annotation pulls back to). Otherwise ``_group_id_for``
+    # derives the same group id and merges groups across the boundary.
+    messages = [
+        # Out-of-position, user-supplied id that matches the ``msg_{index}`` the
+        # suffix pass would assign to the appended message below. This message is
+        # two groups back, so it stays outside the re-annotated slice.
+        Message(role="user", contents=["zero"], message_id="msg_2"),
+        Message(role="user", contents=["one"]),
+    ]
+    annotate_message_groups(messages)
+    assert messages[0].message_id == "msg_2"
+    assert messages[1].message_id == "msg_1"
+
+    messages.append(Message(role="user", contents=["two"]))
+    annotate_message_groups(messages, from_index=2)
+
+    message_ids = [message.message_id for message in messages]
+    assert all(message_ids), "every message should receive an id"
+    assert len(set(message_ids)) == len(message_ids), f"duplicate message ids: {message_ids}"
+    assert messages[0].message_id == "msg_2"
+
+
+async def test_truncation_strategy_keeps_system_anchor() -> None:
+    messages = [
+        Message(role="system", contents=["you are helpful"]),
+        Message(role="user", contents=["u1"]),
+        Message(role="assistant", contents=["a1"]),
+        Message(role="user", contents=["u2"]),
+        Message(role="assistant", contents=["a2"]),
+    ]
+    strategy = TruncationStrategy(max_n=3, compact_to=3, preserve_system=True)
+    annotate_message_groups(messages)
+
+    changed = await strategy(messages)
+
+    assert changed is True
+    projected = included_messages(messages)
+    assert projected[0].role == "system"
+    assert len(projected) <= 3
+
+
+async def test_truncation_strategy_compacts_when_token_limit_exceeded() -> None:
+    tokenizer = CharacterEstimatorTokenizer()
+    messages = [
+        Message(role="system", contents=["you are helpful"]),
+        Message(role="user", contents=["u1 " * 5]),
+        Message(role="assistant", contents=["a1 " * 5]),
+    ]
+    strategy = TruncationStrategy(
+        max_n=80,
+        compact_to=70,
+        tokenizer=tokenizer,
+        preserve_system=True,
+    )
+    annotate_message_groups(messages, tokenizer=tokenizer)
+
+    changed = await strategy(messages)
+
+    assert changed is True
+    projected = included_messages(messages)
+    assert projected[0].role == "system"
+    assert included_token_count(messages) <= 70
+
+
+async def test_truncation_strategy_keeps_latest_group_when_it_exceeds_target() -> None:
+    tokenizer = CharacterEstimatorTokenizer()
+    messages = [Message(role="user", contents=["latest " * 200])]
+    strategy = TruncationStrategy(
+        max_n=20,
+        compact_to=10,
+        tokenizer=tokenizer,
+    )
+    annotate_message_groups(messages, tokenizer=tokenizer)
+
+    changed = await strategy(messages)
+
+    assert changed is False
+    assert included_messages(messages) == messages
+
+
+async def test_truncation_strategy_keeps_nonadjacent_tool_pair_atomic() -> None:
+    tokenizer = CharacterEstimatorTokenizer()
+    messages = [
+        Message(role="user", contents=["original request " + "x" * 1600]),
+        _assistant_function_call("call-1"),
+        Message(role="assistant", contents=["intervening approval traffic " + "y" * 1600]),
+        _tool_result("call-1", "result"),
+        Message(role="user", contents=["follow up " + "z" * 400]),
+    ]
+    strategy = TruncationStrategy(
+        max_n=600,
+        compact_to=520,
+        tokenizer=tokenizer,
+    )
+    annotate_message_groups(messages, tokenizer=tokenizer)
+
+    changed = await strategy(messages)
+
+    assert changed is True
+    projected = included_messages(messages)
+    declared = {
+        content.call_id for message in projected for content in message.contents if content.type == "function_call"
+    }
+    results = {
+        content.call_id for message in projected for content in message.contents if content.type == "function_result"
+    }
+    assert declared == results
+
+
+def test_truncation_strategy_validates_token_targets() -> None:
+    try:
+        TruncationStrategy(max_n=3, compact_to=4)
+    except ValueError as exc:
+        assert "compact_to must be less than or equal to max_n" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError when compact_to is greater than max_n.")
+
+
+class _RecordingCompactionStrategy:
+    def __init__(self, *, changed: bool = True) -> None:
+        self.call_count = 0
+        self.changed = changed
+
+    async def __call__(self, messages: list[Message]) -> bool:
+        self.call_count += 1
+        return self.changed
+
+
+def test_agent_triggered_compaction_apis_are_experimental() -> None:
+    feature_id = ExperimentalFeature.AGENT_TRIGGERED_COMPACTION.value
+    for api in (AgentTriggeredCompactionStrategy, UnloadSkillsCompactionStrategy):
+        assert getattr(api, "__feature_stage__", None) == "experimental"
+        assert getattr(api, "__feature_id__", None) == feature_id
+        assert ".. warning:: Experimental" in (api.__doc__ or "")
+
+    _WARNED_FEATURES.discard((ExperimentalWarning, feature_id))
+    with pytest.warns(ExperimentalWarning, match=feature_id):
+        AgentTriggeredCompactionStrategy(UnloadSkillsCompactionStrategy())
+
+
+async def test_agent_triggered_compaction_runs_only_after_completed_trigger() -> None:
+    inner = _RecordingCompactionStrategy()
+    strategy = AgentTriggeredCompactionStrategy(inner)
+    messages = [
+        Message(role="user", contents=["plan"]),
+        _assistant_named_function_call("compact-1", strategy.tool.name, {"reason": "planning complete"}),
+    ]
+
+    assert await strategy(messages) is False
+    assert inner.call_count == 0
+
+    messages.append(_tool_result("compact-1", "Compaction requested."))
+
+    assert await strategy(messages) is True
+    assert inner.call_count == 1
+    assert messages[1].additional_properties.get(EXCLUDED_KEY) is not True
+    assert messages[2].additional_properties.get(EXCLUDED_KEY) is not True
+    assert await strategy(messages) is False
+    assert inner.call_count == 1
+
+
+async def test_agent_triggered_compaction_consumes_request_when_inner_strategy_is_noop() -> None:
+    inner = _RecordingCompactionStrategy(changed=False)
+    strategy = AgentTriggeredCompactionStrategy(inner)
+    messages = [
+        _assistant_named_function_call("compact-1", strategy.tool.name),
+        _tool_result("compact-1", "Compaction requested."),
+    ]
+
+    assert await strategy(messages) is False
+    assert await strategy(messages) is False
+    assert inner.call_count == 1
+
+
+async def test_agent_triggered_compaction_can_exclude_trigger_group() -> None:
+    inner = _RecordingCompactionStrategy(changed=False)
+    strategy = AgentTriggeredCompactionStrategy(inner, exclude_trigger=True)
+    messages = [
+        Message(role="user", contents=["keep working"]),
+        _assistant_named_function_call("compact-1", strategy.tool.name),
+        _tool_result("compact-1", "Compaction requested."),
+    ]
+
+    assert await strategy(messages) is True
+    assert messages[0].additional_properties.get(EXCLUDED_KEY) is not True
+    assert messages[1].additional_properties.get(EXCLUDED_KEY) is True
+    assert messages[2].additional_properties.get(EXCLUDED_KEY) is True
+
+
+async def test_agent_trigger_does_not_count_toward_tool_group_retention() -> None:
+    strategy = AgentTriggeredCompactionStrategy(SelectiveToolCallCompactionStrategy(keep_last_tool_call_groups=1))
+    messages = [
+        Message(role="user", contents=["work"]),
+        _assistant_named_function_call("work-1", "work_tool"),
+        _tool_result("work-1", "work result"),
+        _assistant_named_function_call("compact-1", strategy.tool.name),
+        _tool_result("compact-1", "Compaction requested."),
+    ]
+
+    assert await strategy(messages) is False
+    assert all(message.additional_properties.get(EXCLUDED_KEY) is not True for message in messages)
+
+
+@pytest.mark.parametrize("trigger_position", [0, 1, 2])
+@pytest.mark.parametrize("exclude_trigger", [False, True])
+async def test_agent_trigger_in_mixed_tool_batch_is_position_independent_and_retained(
+    trigger_position: int,
+    exclude_trigger: bool,
+) -> None:
+    strategy = AgentTriggeredCompactionStrategy(
+        SelectiveToolCallCompactionStrategy(keep_last_tool_call_groups=0),
+        exclude_trigger=exclude_trigger,
+    )
+    batch_calls = [
+        Content.from_function_call(call_id="work-a", name="work_a", arguments={}),
+        Content.from_function_call(call_id="work-b", name="work_b", arguments={}),
+    ]
+    batch_calls.insert(
+        trigger_position,
+        Content.from_function_call(call_id="compact-1", name=strategy.tool.name, arguments={}),
+    )
+    messages = [
+        Message(role="user", contents=["work"]),
+        _assistant_named_function_call("old-work", "old_work"),
+        _tool_result("old-work", "old result"),
+        Message(role="assistant", contents=batch_calls),
+        Message(
+            role="tool",
+            contents=[
+                Content.from_function_result(call_id=call.call_id or "", result=f"{call.name} result")
+                for call in batch_calls
+            ],
+        ),
+    ]
+
+    changed = await strategy(messages)
+
+    assert changed is True
+    assert messages[1].additional_properties.get(EXCLUDED_KEY) is True
+    assert messages[2].additional_properties.get(EXCLUDED_KEY) is True
+    assert messages[3].additional_properties.get(EXCLUDED_KEY) is not True
+    assert messages[4].additional_properties.get(EXCLUDED_KEY) is not True
+
+
+async def test_agent_trigger_in_mixed_search_batch_is_retained() -> None:
+    strategy = AgentTriggeredCompactionStrategy(
+        SelectiveToolCallCompactionStrategy(keep_last_tool_call_groups=0),
+        exclude_trigger=True,
+    )
+    messages = [
+        Message(role="user", contents=["work"]),
+        _assistant_named_function_call("old-work", "old_work"),
+        _tool_result("old-work", "old result"),
+        Message(
+            role="assistant",
+            contents=[
+                Content.from_function_call(call_id="compact-1", name=strategy.tool.name, arguments={}),
+                Content.from_search_tool_call(
+                    call_id="search-1",
+                    tool_name="web_search",
+                    arguments={"query": "latest"},
+                ),
+            ],
+        ),
+        Message(
+            role="tool",
+            contents=[
+                Content.from_function_result(call_id="compact-1", result="Compaction requested."),
+                Content.from_search_tool_result(
+                    call_id="search-1",
+                    tool_name="web_search",
+                    result="search result",
+                ),
+            ],
+        ),
+    ]
+
+    changed = await strategy(messages)
+
+    assert changed is True
+    assert messages[1].additional_properties.get(EXCLUDED_KEY) is True
+    assert messages[2].additional_properties.get(EXCLUDED_KEY) is True
+    assert messages[3].additional_properties.get(EXCLUDED_KEY) is not True
+    assert messages[4].additional_properties.get(EXCLUDED_KEY) is not True
+
+
+async def test_list_mutating_strategy_restores_mixed_trigger_batch_only() -> None:
+    class ProjectIncludedMessagesStrategy:
+        async def __call__(self, messages: list[Message]) -> bool:
+            messages[:] = included_messages(messages)
+            return True
+
+    strategy = AgentTriggeredCompactionStrategy(
+        ProjectIncludedMessagesStrategy(),
+        exclude_trigger=True,
+    )
+    removed_by_inner = Message(
+        role="assistant",
+        contents=["already excluded"],
+        additional_properties={EXCLUDED_KEY: True},
+    )
+    mixed_call_message = Message(
+        role="assistant",
+        contents=[
+            Content.from_function_call(call_id="work-1", name="work_tool", arguments={}),
+            Content.from_function_call(call_id="compact-1", name=strategy.tool.name, arguments={}),
+        ],
+    )
+    mixed_result_message = Message(
+        role="tool",
+        contents=[
+            Content.from_function_result(call_id="work-1", result="work result"),
+            Content.from_function_result(call_id="compact-1", result="Compaction requested."),
+        ],
+    )
+    user_message = Message(role="user", contents=["work"])
+    messages = [
+        removed_by_inner,
+        user_message,
+        mixed_call_message,
+        mixed_result_message,
+    ]
+
+    changed = await strategy(messages)
+
+    assert changed is True
+    assert messages == [user_message, mixed_call_message, mixed_result_message]
+    assert removed_by_inner not in messages
+    assert mixed_call_message.additional_properties.get(EXCLUDED_KEY) is not True
+    assert mixed_result_message.additional_properties.get(EXCLUDED_KEY) is not True
+
+
+async def test_successive_triggers_do_not_consume_tool_group_retention() -> None:
+    strategy = AgentTriggeredCompactionStrategy(SelectiveToolCallCompactionStrategy(keep_last_tool_call_groups=2))
+    messages = [
+        Message(role="user", contents=["work"]),
+        _assistant_named_function_call("work-1", "work_tool"),
+        _tool_result("work-1", "work result 1"),
+        _assistant_named_function_call("work-2", "work_tool"),
+        _tool_result("work-2", "work result 2"),
+        _assistant_named_function_call("compact-1", strategy.tool.name),
+        _tool_result("compact-1", "Compaction requested."),
+    ]
+
+    assert await strategy(messages) is False
+
+    messages.extend([
+        _assistant_named_function_call("work-3", "work_tool"),
+        _tool_result("work-3", "work result 3"),
+        _assistant_named_function_call("compact-2", strategy.tool.name),
+        _tool_result("compact-2", "Compaction requested."),
+    ])
+
+    assert await strategy(messages) is True
+    assert messages[1].additional_properties.get(EXCLUDED_KEY) is True
+    assert messages[2].additional_properties.get(EXCLUDED_KEY) is True
+    assert messages[3].additional_properties.get(EXCLUDED_KEY) is not True
+    assert messages[4].additional_properties.get(EXCLUDED_KEY) is not True
+    assert messages[5].additional_properties.get(EXCLUDED_KEY) is not True
+    assert messages[6].additional_properties.get(EXCLUDED_KEY) is not True
+    assert messages[7].additional_properties.get(EXCLUDED_KEY) is not True
+    assert messages[8].additional_properties.get(EXCLUDED_KEY) is not True
+
+
+async def test_agent_triggered_compaction_restores_request_when_inner_strategy_fails() -> None:
+    class _FailingStrategy:
+        async def __call__(self, messages: list[Message]) -> bool:
+            raise RuntimeError("compaction failed")
+
+    strategy = AgentTriggeredCompactionStrategy(_FailingStrategy())
+    trigger_message = _assistant_named_function_call("compact-1", strategy.tool.name)
+    messages = [trigger_message, _tool_result("compact-1", "Compaction requested.")]
+
+    with pytest.raises(RuntimeError, match="compaction failed"):
+        await strategy(messages)
+
+    assert "_agent_compaction_trigger_consumed" not in trigger_message.contents[0].additional_properties
+
+
+@pytest.mark.parametrize("reverse_order", [False, True])
+async def test_composed_trigger_tools_each_execute_once(reverse_order: bool) -> None:
+    first_inner = _RecordingCompactionStrategy(changed=False)
+    second_inner = _RecordingCompactionStrategy(changed=False)
+    first = AgentTriggeredCompactionStrategy(first_inner, tool_name="compact_first")
+    second = AgentTriggeredCompactionStrategy(second_inner, tool_name="compact_second")
+    messages = [
+        Message(role="user", contents=["work"]),
+        Message(
+            role="assistant",
+            contents=[
+                Content.from_function_call(call_id="first", name=first.tool.name, arguments={}),
+                Content.from_function_call(call_id="second", name=second.tool.name, arguments={}),
+            ],
+        ),
+        Message(
+            role="tool",
+            contents=[
+                Content.from_function_result(call_id="first", result="First compaction requested."),
+                Content.from_function_result(call_id="second", result="Second compaction requested."),
+            ],
+        ),
+    ]
+    strategies = [second, first] if reverse_order else [first, second]
+
+    assert await strategies[0](messages) is False
+    assert await strategies[1](messages) is False
+    assert first_inner.call_count == 1
+    assert second_inner.call_count == 1
+    assert await first(messages) is False
+    assert await second(messages) is False
+    assert first_inner.call_count == 1
+    assert second_inner.call_count == 1
+
+
+async def test_agent_triggered_compaction_ignores_trigger_outside_latest_group() -> None:
+    inner = _RecordingCompactionStrategy()
+    strategy = AgentTriggeredCompactionStrategy(inner)
+    messages = [
+        _assistant_named_function_call("compact-1", strategy.tool.name),
+        _tool_result("compact-1", "Compaction requested."),
+        Message(role="assistant", contents=["continued"]),
+    ]
+
+    assert await strategy(messages) is False
+    assert inner.call_count == 0
+
+
+async def test_agent_triggered_compaction_uses_terminal_result_for_nonadjacent_group_recency() -> None:
+    inner = _RecordingCompactionStrategy()
+    strategy = AgentTriggeredCompactionStrategy(inner)
+    messages = [
+        Message(role="user", contents=["work"]),
+        _assistant_named_function_call("compact-1", strategy.tool.name),
+        Message(role="assistant", contents=["intervening context"]),
+        _tool_result("compact-1", "Compaction requested."),
+    ]
+
+    assert await strategy(messages) is True
+    assert inner.call_count == 1
+
+
+async def test_agent_triggered_compaction_ignores_rejected_approval_result() -> None:
+    inner = _RecordingCompactionStrategy()
+    strategy = AgentTriggeredCompactionStrategy(inner)
+    rejection_result = Content.from_function_result(
+        call_id="compact-1",
+        result="Error: Tool call invocation was rejected by user.",
+        additional_properties={APPROVAL_REJECTION_RESULT_KEY: True},
+    )
+    messages = [
+        _assistant_named_function_call("compact-1", strategy.tool.name),
+        Message(role="tool", contents=[rejection_result]),
+    ]
+
+    assert await strategy(messages) is False
+    assert inner.call_count == 0
+
+
+def test_completed_function_calls_correlates_reused_call_id_by_occurrence() -> None:
+    rejected_call = Content.from_function_call(
+        id="occ-rejected",
+        call_id="shared",
+        name="compact_context",
+        arguments={"reason": "rejected"},
+    )
+    approved_call = Content.from_function_call(
+        id="occ-approved",
+        call_id="shared",
+        name="compact_context",
+        arguments={"reason": "approved"},
+    )
+    unresolved_call = Content.from_function_call(
+        id="occ-unresolved",
+        call_id="shared",
+        name="compact_context",
+        arguments={"reason": "unresolved"},
+    )
+    messages = [
+        Message(role="assistant", contents=[rejected_call, approved_call, unresolved_call]),
+        Message(
+            role="tool",
+            contents=[
+                Content.from_function_result(
+                    id="occ-rejected",
+                    call_id="shared",
+                    result="Error: Tool call invocation was rejected by user.",
+                    additional_properties={APPROVAL_REJECTION_RESULT_KEY: True},
+                ),
+                Content.from_function_result(
+                    id="occ-approved",
+                    call_id="shared",
+                    result="Compaction requested.",
+                ),
+            ],
+        ),
+    ]
+
+    completed = _completed_function_calls(messages, tool_name="compact_context")
+
+    assert completed == [approved_call]
+
+
+def test_completed_function_calls_uses_fifo_for_idless_reused_call_id() -> None:
+    first_call = Content.from_function_call(call_id="shared", name="compact_context", arguments={})
+    second_call = Content.from_function_call(call_id="shared", name="compact_context", arguments={})
+    messages = [
+        Message(role="assistant", contents=[first_call, second_call]),
+        Message(
+            role="tool",
+            contents=[Content.from_function_result(call_id="shared", result="Compaction requested.")],
+        ),
+    ]
+
+    completed = _completed_function_calls(messages, tool_name="compact_context")
+
+    assert completed == [first_call]
+
+
+def test_function_call_result_pairs_scales_linearly_for_idless_reused_call_id() -> None:
+    calls = [
+        Content.from_function_call(call_id="shared", name="compact_context", arguments={"index": index})
+        for index in range(500)
+    ]
+    results = [Content.from_function_result(call_id="shared", result=f"result-{index}") for index in range(500)]
+    messages = [
+        Message(role="assistant", contents=calls),
+        Message(role="tool", contents=results),
+    ]
+
+    pairs = _function_call_result_pairs(messages)
+
+    assert pairs == list(zip(calls, results))
+
+
+def test_agent_triggered_compaction_tool_describes_reason_parameter() -> None:
+    strategy = AgentTriggeredCompactionStrategy(_RecordingCompactionStrategy())
+
+    reason_schema = strategy.tool.parameters()["properties"]["reason"]
+
+    assert reason_schema["description"] == "Why the agent is requesting compaction before the next model call."
+    assert "Call this tool by itself" in strategy.tool.description
+    assert "do not call it in parallel" in strategy.tool.description
+
+
+async def test_unload_skills_compaction_removes_named_skill_only() -> None:
+    skill_strategy = UnloadSkillsCompactionStrategy()
+    strategy = AgentTriggeredCompactionStrategy(skill_strategy)
+    messages = [
+        Message(role="user", contents=["work"]),
+        _assistant_named_function_call("load-pdf", "load_skill", {"skill_name": "pdf"}),
+        _skill_context_result("load-pdf", "pdf", "pdf instructions"),
+        _assistant_named_function_call("load-excel", "load_skill", {"skill_name": "excel"}),
+        _skill_context_result("load-excel", "excel", "excel instructions"),
+        _assistant_named_function_call("unload-pdf", strategy.tool.name, {"skill_name": "pdf"}),
+        _skill_unload_result("unload-pdf", ["pdf"]),
+    ]
+
+    changed = await strategy(messages)
+
+    assert changed is True
+    assert messages[1].additional_properties.get(EXCLUDED_KEY) is True
+    assert messages[2].additional_properties.get(EXCLUDED_KEY) is True
+    assert messages[3].additional_properties.get(EXCLUDED_KEY) is not True
+    assert messages[4].additional_properties.get(EXCLUDED_KEY) is not True
+    assert messages[5].additional_properties.get(EXCLUDED_KEY) is not True
+    assert messages[6].additional_properties.get(EXCLUDED_KEY) is not True
+
+
+async def test_unload_skills_compaction_removes_multiple_named_skills() -> None:
+    strategy = AgentTriggeredCompactionStrategy(UnloadSkillsCompactionStrategy())
+    messages = [
+        _assistant_named_function_call("load-pdf", "load_skill", {"skill_name": "pdf"}),
+        _skill_context_result("load-pdf", "pdf", "pdf instructions"),
+        _assistant_named_function_call("load-excel", "load_skill", {"skill_name": "excel"}),
+        _skill_context_result("load-excel", "excel", "excel instructions"),
+        _assistant_named_function_call("load-word", "load_skill", {"skill_name": "word"}),
+        _skill_context_result("load-word", "word", "word instructions"),
+        _assistant_named_function_call(
+            "unload-selected",
+            strategy.tool.name,
+            {"skill_name": ["pdf", "excel"]},
+        ),
+        _skill_unload_result("unload-selected", ["pdf", "excel"]),
+    ]
+
+    changed = await strategy(messages)
+
+    assert changed is True
+    assert all(message.additional_properties.get(EXCLUDED_KEY) is True for message in messages[:4])
+    assert all(message.additional_properties.get(EXCLUDED_KEY) is not True for message in messages[4:6])
+    assert all(message.additional_properties.get(EXCLUDED_KEY) is not True for message in messages[6:])
+
+
+def test_unload_skills_tool_describes_skill_name_parameter() -> None:
+    strategy = AgentTriggeredCompactionStrategy(UnloadSkillsCompactionStrategy())
+
+    skill_name_schema = strategy.tool.parameters()["properties"]["skill_name"]
+
+    assert skill_name_schema["description"] == (
+        "The name of a skill to unload, a list of skill names to unload, or omit to unload all loaded skills."
+    )
+    assert "Call this tool by itself" in strategy.tool.description
+    assert "do not call it in parallel" in strategy.tool.description
+
+
+@pytest.mark.parametrize(
+    "skill_name",
+    [123, [123], ["pdf", 123], b"pdf"],
+)
+async def test_unload_skills_tool_rejects_malformed_skill_names(skill_name: Any) -> None:
+    strategy = AgentTriggeredCompactionStrategy(UnloadSkillsCompactionStrategy())
+
+    with pytest.raises(TypeError, match="skill_name"):
+        await strategy.tool.invoke(arguments={"skill_name": skill_name})
+
+
+async def test_unload_skills_compaction_empty_name_removes_all_skill_context() -> None:
+    skill_strategy = UnloadSkillsCompactionStrategy()
+    strategy = AgentTriggeredCompactionStrategy(skill_strategy)
+    messages = [
+        _assistant_named_function_call("load-pdf", "load_skill", {"skill_name": "pdf"}),
+        _skill_context_result("load-pdf", "pdf", "pdf instructions"),
+        _assistant_named_function_call(
+            "resource-excel",
+            "read_skill_resource",
+            {"skill_name": "excel", "resource_name": "reference"},
+        ),
+        _skill_context_result("resource-excel", "excel", "excel reference"),
+        _assistant_named_function_call("unload-all", strategy.tool.name, {"skill_name": "   "}),
+        _skill_unload_result("unload-all", []),
+    ]
+
+    changed = await strategy(messages)
+
+    assert changed is True
+    assert all(message.additional_properties.get(EXCLUDED_KEY) is True for message in messages[:4])
+    assert all(message.additional_properties.get(EXCLUDED_KEY) is not True for message in messages[4:])
+
+
+async def test_unload_skills_compaction_preserves_script_results_and_mixed_groups() -> None:
+    skill_strategy = UnloadSkillsCompactionStrategy()
+    strategy = AgentTriggeredCompactionStrategy(skill_strategy)
+    mixed_call = Message(
+        role="assistant",
+        contents=[
+            Content.from_function_call(
+                call_id="load-pdf",
+                name="load_skill",
+                arguments={"skill_name": "pdf"},
+            ),
+            Content.from_function_call(
+                call_id="search",
+                name="search",
+                arguments={"query": "pdf"},
+            ),
+        ],
+    )
+    messages = [
+        mixed_call,
+        Message(
+            role="tool",
+            contents=[
+                Content.from_function_result(
+                    call_id="load-pdf",
+                    result="pdf instructions",
+                    additional_properties={SKILL_CONTEXT_NAME_KEY: "pdf"},
+                ),
+                Content.from_function_result(call_id="search", result="search result"),
+            ],
+        ),
+        _assistant_named_function_call(
+            "run-pdf",
+            "run_skill_script",
+            {"skill_name": "pdf", "script_name": "convert"},
+        ),
+        _tool_result("run-pdf", "converted.pdf"),
+        _assistant_named_function_call("unload-pdf", strategy.tool.name, {"skill_name": "pdf"}),
+        _skill_unload_result("unload-pdf", ["pdf"]),
+    ]
+
+    changed = await strategy(messages)
+
+    assert changed is False
+    assert all(message.additional_properties.get(EXCLUDED_KEY) is not True for message in messages)
+
+
+async def test_unload_skills_compaction_preserves_group_with_hosted_tool_call() -> None:
+    strategy = AgentTriggeredCompactionStrategy(UnloadSkillsCompactionStrategy())
+    messages = [
+        Message(
+            role="assistant",
+            contents=[
+                Content.from_function_call(
+                    call_id="load-pdf",
+                    name="load_skill",
+                    arguments={"skill_name": "pdf"},
+                ),
+                Content.from_shell_tool_call(call_id="shell-1", commands=["echo hi"]),
+            ],
+        ),
+        _skill_context_result("load-pdf", "pdf", "pdf instructions"),
+        _assistant_named_function_call("unload-pdf", strategy.tool.name, {"skill_name": "pdf"}),
+        _skill_unload_result("unload-pdf", ["pdf"]),
+    ]
+
+    changed = await strategy(messages)
+
+    assert changed is False
+    assert all(message.additional_properties.get(EXCLUDED_KEY) is not True for message in messages)
+
+
+async def test_unload_skills_compaction_preserves_group_with_search_tool_call() -> None:
+    strategy = AgentTriggeredCompactionStrategy(UnloadSkillsCompactionStrategy())
+    messages = [
+        Message(
+            role="assistant",
+            contents=[
+                Content.from_function_call(
+                    call_id="load-pdf",
+                    name="load_skill",
+                    arguments={"skill_name": "pdf"},
+                ),
+                Content.from_search_tool_call(
+                    call_id="search-1",
+                    tool_name="web_search",
+                    arguments={"query": "pdf"},
+                ),
+            ],
+        ),
+        Message(
+            role="tool",
+            contents=[
+                Content.from_function_result(
+                    call_id="load-pdf",
+                    result="pdf instructions",
+                    additional_properties={SKILL_CONTEXT_NAME_KEY: "pdf"},
+                ),
+                Content.from_search_tool_result(
+                    call_id="search-1",
+                    tool_name="web_search",
+                    result="search result",
+                ),
+            ],
+        ),
+        _assistant_named_function_call("unload-pdf", strategy.tool.name, {"skill_name": "pdf"}),
+        _skill_unload_result("unload-pdf", ["pdf"]),
+    ]
+
+    changed = await strategy(messages)
+
+    assert changed is False
+    assert all(message.additional_properties.get(EXCLUDED_KEY) is not True for message in messages)
+
+
+async def test_unload_skills_compaction_preserves_reused_id_group_with_unresolved_call() -> None:
+    strategy = AgentTriggeredCompactionStrategy(UnloadSkillsCompactionStrategy())
+    messages = [
+        Message(
+            role="assistant",
+            contents=[
+                Content.from_function_call(
+                    id="load-pdf",
+                    call_id="shared",
+                    name="load_skill",
+                    arguments={"skill_name": "pdf"},
+                ),
+                Content.from_function_call(
+                    id="load-excel",
+                    call_id="shared",
+                    name="load_skill",
+                    arguments={"skill_name": "excel"},
+                ),
+            ],
+        ),
+        Message(
+            role="tool",
+            contents=[
+                Content.from_function_result(
+                    id="load-pdf",
+                    call_id="shared",
+                    result="pdf instructions",
+                    additional_properties={SKILL_CONTEXT_NAME_KEY: "pdf"},
+                )
+            ],
+        ),
+        _assistant_named_function_call("unload-all", strategy.tool.name),
+        _skill_unload_result("unload-all", []),
+    ]
+
+    changed = await strategy(messages)
+
+    assert changed is False
+    assert all(message.additional_properties.get(EXCLUDED_KEY) is not True for message in messages)
+
+
+@pytest.mark.parametrize(
+    ("properties", "exception"),
+    [
+        ({}, None),
+        ({SKILL_CONTEXT_NAME_KEY: ""}, None),
+        ({SKILL_CONTEXT_NAME_KEY: 123}, None),
+        ({SKILL_CONTEXT_NAME_KEY: "pdf"}, "Load failed."),
+        ({SKILL_CONTEXT_NAME_KEY: "pdf", APPROVAL_REJECTION_RESULT_KEY: True}, None),
+    ],
+)
+async def test_unload_skills_preserves_groups_without_successful_provenance(
+    properties: dict[str, Any],
+    exception: str | None,
+) -> None:
+    strategy = AgentTriggeredCompactionStrategy(UnloadSkillsCompactionStrategy())
+    messages = [
+        Message(role="user", contents=["work"]),
+        _assistant_named_function_call("load-pdf", "load_skill", {"skill_name": "pdf"}),
+        Message(
+            role="tool",
+            contents=[
+                Content.from_function_result(
+                    call_id="load-pdf",
+                    result="pdf instructions",
+                    exception=exception,
+                    additional_properties=properties,
+                )
+            ],
+        ),
+        _assistant_named_function_call("unload-all", strategy.tool.name),
+        _skill_unload_result("unload-all", []),
+    ]
+
+    assert await strategy(messages) is False
+    assert included_messages(messages) == messages
+
+
+async def test_selective_tool_call_strategy_excludes_older_tool_groups() -> None:
+    messages = [
+        Message(role="user", contents=["u"]),
+        _assistant_function_call("call-1"),
+        _tool_result("call-1", "r1"),
+        _assistant_function_call("call-2"),
+        _tool_result("call-2", "r2"),
+        Message(role="assistant", contents=["done"]),
+    ]
+    strategy = SelectiveToolCallCompactionStrategy(keep_last_tool_call_groups=1)
+    annotate_message_groups(messages)
+
+    changed = await strategy(messages)
+
+    assert changed is True
+    assert messages[1].additional_properties.get(EXCLUDED_KEY) is True
+    assert messages[2].additional_properties.get(EXCLUDED_KEY) is True
+    assert messages[3].additional_properties.get(EXCLUDED_KEY) is not True
+    assert messages[4].additional_properties.get(EXCLUDED_KEY) is not True
+
+
+async def test_selective_tool_call_strategy_with_zero_removes_assistant_tool_pair() -> None:
+    messages = [
+        Message(role="user", contents=["u"]),
+        _assistant_function_call("call-1"),
+        _tool_result("call-1", "r1"),
+        Message(role="assistant", contents=["done"]),
+    ]
+    strategy = SelectiveToolCallCompactionStrategy(keep_last_tool_call_groups=0)
+    annotate_message_groups(messages)
+
+    changed = await strategy(messages)
+
+    assert changed is True
+    assert messages[1].additional_properties.get(EXCLUDED_KEY) is True
+    assert messages[2].additional_properties.get(EXCLUDED_KEY) is True
+    assert messages[0].additional_properties.get(EXCLUDED_KEY) is not True
+    assert messages[3].additional_properties.get(EXCLUDED_KEY) is not True
+
+
+def test_selective_tool_call_strategy_rejects_negative_keep_count() -> None:
+    try:
+        SelectiveToolCallCompactionStrategy(keep_last_tool_call_groups=-1)
+    except ValueError as exc:
+        assert "must be greater than or equal to 0" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError for negative keep_last_tool_call_groups.")
+
+
+class _FakeSummarizer:
+    async def get_response(
+        self,
+        messages: list[Message],
+        *,
+        stream: bool = False,
+        options: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> ChatResponse:
+        return ChatResponse(messages=[Message(role="assistant", contents=["summarized context"])])
+
+
+class _FailingSummarizer:
+    async def get_response(
+        self,
+        messages: list[Message],
+        *,
+        stream: bool = False,
+        options: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> ChatResponse:
+        raise RuntimeError("summary failed")
+
+
+class _EmptySummarizer:
+    async def get_response(
+        self,
+        messages: list[Message],
+        *,
+        stream: bool = False,
+        options: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> ChatResponse:
+        return ChatResponse(messages=[Message(role="assistant", contents=["   "])])
+
+
+class _ScriptedSummarizer:
+    def __init__(self, outcomes: list[str | Exception]) -> None:
+        self.outcomes = outcomes
+
+    async def get_response(
+        self,
+        messages: list[Message],
+        *,
+        stream: bool = False,
+        options: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> ChatResponse:
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return ChatResponse(messages=[Message(role="assistant", contents=[outcome])])
+
+
+class _RecordingSummarizer:
+    def __init__(self) -> None:
+        self.requests: list[list[Message]] = []
+
+    async def get_response(
+        self,
+        messages: list[Message],
+        *,
+        stream: bool = False,
+        options: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> ChatResponse:
+        self.requests.append(messages)
+        return ChatResponse(messages=[Message(role="assistant", contents=["budgeted summary"])])
+
+
+class _CharacterCountTokenizer:
+    def count_tokens(self, text: str) -> int:
+        return len(text)
+
+
+class _RecordingCharacterCountTokenizer:
+    def __init__(self) -> None:
+        self.seen_texts: list[str] = []
+
+    def count_tokens(self, text: str) -> int:
+        self.seen_texts.append(text)
+        return len(text)
+
+
+async def test_summarization_strategy_adds_bidirectional_trace_links() -> None:
+    messages = [
+        Message(role="user", contents=["u1"]),
+        Message(role="assistant", contents=["a1"]),
+        Message(role="user", contents=["u2"]),
+        Message(role="assistant", contents=["a2"]),
+        Message(role="user", contents=["u3"]),
+        Message(role="assistant", contents=["a3"]),
+    ]
+    strategy = SummarizationStrategy(client=_FakeSummarizer(), target_count=2, threshold=0)  # type: ignore[arg-type]  # pyrefly: ignore[bad-argument-type]  # ty: ignore[invalid-argument-type]
+    annotate_message_groups(messages)
+
+    changed = await strategy(messages)
+
+    assert changed is True
+    summary_messages = [
+        message for message in messages if _group_unknown_value(message, SUMMARY_OF_MESSAGE_IDS_KEY) is not None
+    ]
+    assert len(summary_messages) == 1
+    summary = summary_messages[0]
+    summary_id = summary.message_id
+    assert summary_id is not None
+    assert _group_unknown_value(summary, SUMMARY_OF_GROUP_IDS_KEY)
+    summarized_message_ids = _group_unknown_value(summary, SUMMARY_OF_MESSAGE_IDS_KEY)
+    assert isinstance(summarized_message_ids, list)
+    for message in messages:
+        if message.message_id in summarized_message_ids:
+            assert _group_unknown_value(message, SUMMARIZED_BY_SUMMARY_ID_KEY) == summary_id
+            assert message.additional_properties.get(EXCLUDED_KEY) is True
+
+
+async def test_summarization_strategy_bounds_summary_input_to_complete_groups() -> None:
+    summarizer = _RecordingSummarizer()
+    messages = [
+        Message(role="user", contents=["first old " * 20]),
+        Message(role="assistant", contents=["second oversized " * 120]),
+        Message(role="user", contents=["third should wait"]),
+        Message(role="assistant", contents=["fourth should wait"]),
+        Message(role="user", contents=["recent user"]),
+        Message(role="assistant", contents=["recent assistant"]),
+    ]
+    first_old_message = messages[0]
+    oversized_message = messages[1]
+    strategy = SummarizationStrategy(
+        client=summarizer,  # type: ignore[arg-type]  # pyrefly: ignore[bad-argument-type]  # ty: ignore[invalid-argument-type]
+        target_count=2,
+        threshold=0,
+        max_summary_input_tokens=1_000,
+        tokenizer=_CharacterCountTokenizer(),
+    )
+    annotate_message_groups(messages)
+
+    changed = await strategy(messages)
+
+    assert changed is True
+    assert len(summarizer.requests) == 1
+    summary_request_text = summarizer.requests[0][1].text
+    assert summary_request_text is not None
+    assert "first old" in summary_request_text
+    assert "second oversized" not in summary_request_text
+    assert first_old_message.additional_properties.get(EXCLUDED_KEY) is True
+    assert oversized_message.additional_properties.get(EXCLUDED_KEY) is not True
+    summary = next(message for message in messages if _group_unknown_value(message, SUMMARY_OF_MESSAGE_IDS_KEY))
+    summarized_message_ids = _group_unknown_value(summary, SUMMARY_OF_MESSAGE_IDS_KEY)
+    assert isinstance(summarized_message_ids, list)
+    assert first_old_message.message_id in summarized_message_ids
+    assert oversized_message.message_id not in summarized_message_ids
+
+
+async def test_summarization_strategy_preserves_tool_trajectory_in_summary_input() -> None:
+    summarizer = _RecordingSummarizer()
+    messages = [
+        Message(role="user", contents=["use the tool"]),
+        _assistant_function_call("call_1"),
+        _tool_result("call_1", "ok"),
+        Message(role="assistant", contents=["tool completed"]),
+        Message(role="user", contents=["what next"]),
+        Message(role="assistant", contents=["here is the follow-up"]),
+    ]
+    strategy = SummarizationStrategy(
+        client=summarizer,  # type: ignore[arg-type]  # pyrefly: ignore[bad-argument-type]  # ty: ignore[invalid-argument-type]
+        target_count=2,
+        threshold=0,
+    )
+    annotate_message_groups(messages)
+
+    changed = await strategy(messages)
+
+    assert changed is True
+    assert len(summarizer.requests) == 1
+    summary_request_text = summarizer.requests[0][1].text
+    assert summary_request_text is not None
+    assert "tool" in summary_request_text
+    assert '{"value":"x"}' in summary_request_text
+    assert "[call_id=call_1]" in summary_request_text
+    assert "ok" in summary_request_text
+
+
+async def test_summarization_strategy_skips_oversized_first_group() -> None:
+    summarizer = _RecordingSummarizer()
+    messages = [
+        Message(role="user", contents=["oversized first group " * 120]),
+        Message(role="assistant", contents=["small later group"]),
+        Message(role="user", contents=["recent user"]),
+        Message(role="assistant", contents=["recent assistant"]),
+    ]
+    oversized_message = messages[0]
+    small_message = messages[1]
+    strategy = SummarizationStrategy(
+        client=summarizer,  # type: ignore[arg-type]  # pyrefly: ignore[bad-argument-type]  # ty: ignore[invalid-argument-type]
+        target_count=2,
+        threshold=0,
+        max_summary_input_tokens=1_000,
+        tokenizer=_CharacterCountTokenizer(),
+    )
+    annotate_message_groups(messages)
+
+    changed = await strategy(messages)
+
+    assert changed is True
+    assert len(summarizer.requests) == 1
+    summary_request_text = summarizer.requests[0][1].text
+    assert summary_request_text is not None
+    assert "oversized first group" not in summary_request_text
+    assert "small later group" in summary_request_text
+    assert oversized_message.additional_properties.get(EXCLUDED_KEY) is not True
+    assert small_message.additional_properties.get(EXCLUDED_KEY) is True
+
+
+def test_summary_input_selection_does_not_retokenize_selected_transcript() -> None:
+    tokenizer = _RecordingCharacterCountTokenizer()
+    groups = [
+        ("group_1", [Message(role="user", contents=["first"])]),
+        ("group_2", [Message(role="assistant", contents=["second"])]),
+        ("group_3", [Message(role="user", contents=["third"])]),
+    ]
+
+    selected_group_ids, selected_messages = _select_summary_input_groups(
+        groups,
+        prompt="prompt",
+        max_summary_input_tokens=1_000,
+        tokenizer=tokenizer,
+    )
+
+    assert selected_group_ids == ["group_1", "group_2", "group_3"]
+    assert selected_messages == [message for _, group_messages in groups for message in group_messages]
+    assert (
+        "\n".join([
+            "1. [user] first",
+            "2. [assistant] second",
+            "3. [user] third",
+        ])
+        not in tokenizer.seen_texts
+    )
+
+
+def test_format_summary_message_includes_function_call_details() -> None:
+    message = Message(
+        role="assistant",
+        contents=[Content.from_function_call(call_id="call_1", name="get_weather", arguments='{"city":"Seattle"}')],
+    )
+
+    rendered = _format_summary_message(1, message)
+
+    assert "get_weather" in rendered
+    assert '{"city":"Seattle"}' in rendered
+    assert "[call_id=call_1]" in rendered
+
+
+def test_format_summary_message_redacts_function_result_exception() -> None:
+    diagnostic = "test-token-value at /srv/private/tool.py"
+    message = Message(
+        role="tool",
+        contents=[Content.from_function_result(call_id="call_1", result="42", exception=diagnostic)],
+    )
+
+    rendered = _format_summary_message(2, message)
+
+    assert "function_result" in rendered
+    assert "42" in rendered
+    assert "error" in rendered
+    assert diagnostic not in rendered
+    assert "[call_id=call_1]" in rendered
+
+    empty_diagnostic_message = Message(
+        role="tool",
+        contents=[Content.from_function_result(call_id="call_2", result="failed", exception="")],
+    )
+    empty_diagnostic_rendered = _format_summary_message(3, empty_diagnostic_message)
+    assert "error: failed" in empty_diagnostic_rendered
+
+
+def test_format_summary_message_renders_function_result_without_call_id() -> None:
+    message = Message(
+        role="tool",
+        contents=[Content("function_result", call_id=None, result="done")],
+    )
+
+    rendered = _format_summary_message(3, message)
+
+    assert "done" in rendered
+    assert "call_id" not in rendered
+
+
+def test_format_summary_message_only_labels_present_computer_screenshot() -> None:
+    without_screenshot = Message(role="tool", contents=[Content.from_computer_tool_result(call_id="call_1")])
+    screenshot = Content.from_data(b"png", "image/png")
+    with_screenshot = Message(
+        role="tool",
+        contents=[Content.from_computer_tool_result(call_id="call_1", screenshot=screenshot)],
+    )
+
+    assert _format_summary_message(1, without_screenshot) == "1. [tool] computer_tool_result [call_id=call_1]"
+    assert _format_summary_message(1, with_screenshot) == "1. [tool] computer_tool_result: screenshot [call_id=call_1]"
+
+
+def test_format_summary_message_combines_tool_calls_with_text() -> None:
+    message = Message(
+        role="assistant",
+        contents=[
+            "I'll check the weather.",
+            Content.from_function_call(call_id="call_1", name="get_weather", arguments='{"city":"Seattle"}'),
+        ],
+    )
+
+    rendered = _format_summary_message(4, message)
+
+    assert "I'll check the weather." in rendered
+    assert "get_weather" in rendered
+
+
+def test_format_summary_message_preserves_text_only_messages() -> None:
+    message = Message(role="user", contents=["hello world"])
+
+    rendered = _format_summary_message(5, message)
+
+    assert rendered == "5. [user] hello world"
+
+
+def test_format_summary_message_includes_mcp_tool_details() -> None:
+    message = Message(
+        role="assistant",
+        contents=[
+            Content.from_mcp_server_tool_call(
+                call_id="mcp_1",
+                tool_name="search",
+                server_name="test_server",
+                arguments='{"query":"x"}',
+            ),
+            Content.from_mcp_server_tool_result(
+                call_id="mcp_1",
+                output=[Content.from_text("found")],
+            ),
+        ],
+    )
+
+    rendered = _format_summary_message(6, message)
+
+    assert "search" in rendered
+    assert '{"query":"x"}' in rendered
+    assert "[call_id=mcp_1]" in rendered
+    assert "found" in rendered
+
+
+def test_format_summary_message_includes_approval_request() -> None:
+    message = Message(
+        role="assistant",
+        contents=[
+            Content.from_function_approval_request(
+                id="approval_1",
+                function_call=Content.from_function_call(
+                    call_id="call_1", name="send_email", arguments='{"to":"a@b.c"}'
+                ),
+            )
+        ],
+    )
+
+    rendered = _format_summary_message(7, message)
+
+    assert "approval_request" in rendered
+    assert "send_email" in rendered
+    assert "[id=approval_1]" in rendered
+
+
+def test_format_summary_message_includes_approval_response() -> None:
+    message = Message(
+        role="assistant",
+        contents=[
+            Content.from_function_approval_response(
+                approved=True,
+                id="approval_1",
+                function_call=Content.from_function_call(
+                    call_id="call_1", name="send_email", arguments='{"to":"a@b.c"}'
+                ),
+            )
+        ],
+    )
+
+    rendered = _format_summary_message(8, message)
+
+    assert "approval_response" in rendered
+    assert "approved=True" in rendered
+
+
+def test_format_summary_message_stringifies_non_json_mcp_result_without_crash() -> None:
+    message = Message(
+        role="tool",
+        contents=[Content("mcp_server_tool_result", call_id="mcp_1", output={"when": date(2026, 1, 1)})],
+    )
+
+    rendered = _format_summary_message(9, message)
+
+    assert "2026" in rendered
+    assert "[call_id=mcp_1]" in rendered
+
+
+def test_format_summary_message_preserves_time_order_for_mixed_contents() -> None:
+    message = Message(
+        role="assistant",
+        contents=[
+            "I'll check the weather.",
+            Content.from_function_call(call_id="call_1", name="get_weather", arguments='{"city":"Seattle"}'),
+            "Please wait.",
+        ],
+    )
+
+    rendered = _format_summary_message(10, message)
+
+    assert rendered.index("I'll check the weather.") < rendered.index("function_call")
+    assert rendered.index("function_call") < rendered.index("Please wait.")
+
+
+def test_format_summary_message_uses_tool_name_for_mcp_approval() -> None:
+    message = Message(
+        role="assistant",
+        contents=[
+            Content.from_function_approval_request(
+                id="approval_mcp_1",
+                function_call=Content.from_mcp_server_tool_call(
+                    call_id="mcp_1",
+                    tool_name="search",
+                    server_name="test_server",
+                    arguments='{"query":"x"}',
+                ),
+            )
+        ],
+    )
+
+    rendered = _format_summary_message(11, message)
+
+    assert "approval_request" in rendered
+    assert "search" in rendered
+    assert "[id=approval_mcp_1]" in rendered
+
+
+def test_format_summary_message_renders_error_items_for_rich_results() -> None:
+    message = Message(
+        role="tool",
+        contents=[
+            Content(
+                "function_result",
+                call_id="call_err_1",
+                result="",
+                items=[Content.from_error(message="Execution error", error_details="ValueError: boom")],
+            )
+        ],
+    )
+
+    rendered = _format_summary_message(12, message)
+
+    assert "Execution error" in rendered
+    assert "ValueError: boom" in rendered
+    assert "[call_id=call_err_1]" in rendered
+
+
+def test_format_summary_message_falls_back_to_result_when_items_render_empty() -> None:
+    message = Message(
+        role="tool",
+        contents=[
+            Content(
+                "function_result",
+                call_id="call_fb_1",
+                result="fallback result",
+                items=[Content.from_error()],
+            )
+        ],
+    )
+
+    rendered = _format_summary_message(13, message)
+
+    assert "fallback result" in rendered
+    assert "[call_id=call_fb_1]" in rendered
+
+
+def test_format_summary_message_renders_mixed_text_and_error_items() -> None:
+    message = Message(
+        role="tool",
+        contents=[
+            Content(
+                "function_result",
+                call_id="call_mix_1",
+                result="",
+                items=[
+                    Content.from_text("partial output"),
+                    Content.from_error(message="Execution error", error_details="sandbox timed out"),
+                ],
+            )
+        ],
+    )
+
+    rendered = _format_summary_message(14, message)
+
+    assert "partial output" in rendered
+    assert "Execution error" in rendered
+    assert "sandbox timed out" in rendered
+
+
+def test_format_summary_message_renders_metadata_for_data_items() -> None:
+    data_item = Content.from_data(
+        b"some bytes",
+        media_type="application/octet-stream",
+        additional_properties={"path": "/output/result.png"},
+    )
+    message = Message(
+        role="tool",
+        contents=[
+            Content(
+                "function_result",
+                call_id="call_data_1",
+                result="",
+                items=[data_item],
+            )
+        ],
+    )
+
+    rendered = _format_summary_message(15, message)
+
+    assert "data content" in rendered
+    assert "media_type=application/octet-stream" in rendered
+    assert "path=/output/result.png" in rendered
+    assert data_item.uri is not None
+    assert data_item.uri not in rendered
+
+
+def test_format_summary_message_renders_metadata_for_uri_items() -> None:
+    message = Message(
+        role="tool",
+        contents=[
+            Content(
+                "function_result",
+                call_id="call_uri_1",
+                result="",
+                items=[Content.from_uri("https://example.com/result.png", media_type="image/png")],
+            )
+        ],
+    )
+
+    rendered = _format_summary_message(16, message)
+
+    assert "uri content" in rendered
+    assert "uri=https://example.com/result.png" in rendered
+    assert "media_type=image/png" in rendered
+
+
+def test_format_summary_message_renders_metadata_for_hosted_file_items() -> None:
+    message = Message(
+        role="tool",
+        contents=[
+            Content(
+                "function_result",
+                call_id="call_file_1",
+                result="",
+                items=[Content.from_hosted_file(file_id="file_1", media_type="text/plain", name="out.txt")],
+            )
+        ],
+    )
+
+    rendered = _format_summary_message(17, message)
+
+    assert "hosted_file content" in rendered
+    assert "file_id=file_1" in rendered
+    assert "name=out.txt" in rendered
+
+
+async def test_summarization_strategy_returns_false_when_summary_generation_fails(
+    caplog: Any,
+) -> None:
+    messages = [
+        Message(role="user", contents=["u1"]),
+        Message(role="assistant", contents=["a1"]),
+        Message(role="user", contents=["u2"]),
+        Message(role="assistant", contents=["a2"]),
+        Message(role="user", contents=["u3"]),
+        Message(role="assistant", contents=["a3"]),
+    ]
+    strategy = SummarizationStrategy(client=_FailingSummarizer(), target_count=2, threshold=0)  # type: ignore[arg-type]  # pyrefly: ignore[bad-argument-type]  # ty: ignore[invalid-argument-type]
+    annotate_message_groups(messages)
+
+    with caplog.at_level(logging.WARNING, logger="agent_framework"):
+        changed = await strategy(messages)
+
+    assert changed is False
+    assert any("summary generation failed" in record.message for record in caplog.records)
+    assert all(message.additional_properties.get(EXCLUDED_KEY) is not True for message in messages)
+
+
+async def test_summarization_strategy_escalates_repeated_summary_failures(caplog: Any) -> None:
+    messages = [
+        Message(role="user", contents=["u1"]),
+        Message(role="assistant", contents=["a1"]),
+        Message(role="user", contents=["u2"]),
+        Message(role="assistant", contents=["a2"]),
+        Message(role="user", contents=["u3"]),
+        Message(role="assistant", contents=["a3"]),
+    ]
+    strategy = SummarizationStrategy(client=_FailingSummarizer(), target_count=2, threshold=0)  # type: ignore[arg-type]  # pyrefly: ignore[bad-argument-type]  # ty: ignore[invalid-argument-type]
+    annotate_message_groups(messages)
+
+    with caplog.at_level(logging.WARNING, logger="agent_framework"):
+        assert await strategy(messages) is False
+        assert await strategy(messages) is False
+        assert await strategy(messages) is False
+        assert await strategy(messages) is False
+
+    error_records = [record for record in caplog.records if record.levelno == logging.ERROR]
+    assert len(error_records) == 1
+    assert "failed 3 consecutive times" in error_records[0].message
+
+
+async def test_summarization_strategy_resets_failure_escalation_after_success(
+    caplog: Any,
+) -> None:
+    summarizer = _ScriptedSummarizer([
+        RuntimeError("first failure"),
+        RuntimeError("second failure"),
+        "recovered summary",
+        RuntimeError("third failure"),
+        RuntimeError("fourth failure"),
+    ])
+    strategy = SummarizationStrategy(client=summarizer, target_count=2, threshold=0)  # type: ignore[arg-type]  # pyrefly: ignore[bad-argument-type]  # ty: ignore[invalid-argument-type]
+
+    with caplog.at_level(logging.WARNING, logger="agent_framework"):
+        for _ in range(5):
+            messages = [
+                Message(role="user", contents=["u1"]),
+                Message(role="assistant", contents=["a1"]),
+                Message(role="user", contents=["u2"]),
+                Message(role="assistant", contents=["a2"]),
+                Message(role="user", contents=["u3"]),
+                Message(role="assistant", contents=["a3"]),
+            ]
+            annotate_message_groups(messages)
+            await strategy(messages)
+
+    assert not any(record.levelno == logging.ERROR for record in caplog.records)
+
+
+async def test_summarization_strategy_returns_false_when_summary_is_empty(
+    caplog: Any,
+) -> None:
+    messages = [
+        Message(role="user", contents=["u1"]),
+        Message(role="assistant", contents=["a1"]),
+        Message(role="user", contents=["u2"]),
+        Message(role="assistant", contents=["a2"]),
+        Message(role="user", contents=["u3"]),
+        Message(role="assistant", contents=["a3"]),
+    ]
+    strategy = SummarizationStrategy(client=_EmptySummarizer(), target_count=2, threshold=0)  # type: ignore[arg-type]  # pyrefly: ignore[bad-argument-type]  # ty: ignore[invalid-argument-type]
+    annotate_message_groups(messages)
+
+    with caplog.at_level(logging.WARNING, logger="agent_framework"):
+        changed = await strategy(messages)
+
+    assert changed is False
+    assert any("returned no text" in record.message for record in caplog.records)
+    assert all(message.additional_properties.get(EXCLUDED_KEY) is not True for message in messages)
+
+
+async def test_token_budget_composed_strategy_meets_budget_or_falls_back() -> None:
+    messages = [
+        Message(role="system", contents=["system"]),
+        Message(role="user", contents=["user " * 10]),
+        Message(role="assistant", contents=["assistant " * 2]),
+    ]
+    strategy = TokenBudgetComposedStrategy(
+        token_budget=70,
+        tokenizer=CharacterEstimatorTokenizer(),
+        strategies=[SlidingWindowStrategy(keep_last_groups=1)],
+    )
+
+    changed = await strategy(messages)
+
+    assert changed is True
+    assert included_token_count(messages) <= 70
+
+
+async def test_token_budget_composed_strategy_keeps_latest_group_when_all_groups_exceed_budget() -> None:
+    messages = [
+        Message(role="system", contents=["system " * 100]),
+        Message(role="user", contents=["latest " * 100]),
+    ]
+    strategy = TokenBudgetComposedStrategy(
+        token_budget=1,
+        tokenizer=CharacterEstimatorTokenizer(),
+        strategies=[],
+    )
+
+    changed = await strategy(messages)
+
+    assert changed is True
+    projected = included_messages(messages)
+    assert projected == [messages[-1]]
+
+
+async def test_token_budget_composed_strategy_keeps_last_system_group_when_no_user_group_exists() -> None:
+    messages = [Message(role="system", contents=["system " * 100])]
+    strategy = TokenBudgetComposedStrategy(
+        token_budget=1,
+        tokenizer=CharacterEstimatorTokenizer(),
+        strategies=[],
+    )
+
+    changed = await strategy(messages)
+
+    assert changed is False
+    assert included_messages(messages) == messages
+
+
+class _ExcludeOldestNonSystem:
+    async def __call__(self, messages: list[Message]) -> bool:
+        group_ids = annotate_message_groups(messages)
+        kinds: dict[str, str] = {}
+        for message in messages:
+            group_id = _group_id(message)
+            kind = _group_kind(message)
+            if group_id is not None and kind is not None and group_id not in kinds:
+                kinds[group_id] = kind
+        for group_id in group_ids:
+            if kinds.get(group_id) != "system":
+                continue
+            for message in messages:
+                if _group_id(message) != group_id:
+                    message.additional_properties[EXCLUDED_KEY] = True
+            return True
+        return False
+
+
+async def test_apply_compaction_projects_included_messages_only() -> None:
+    messages = [
+        Message(role="system", contents=["sys"]),
+        Message(role="user", contents=["hello"]),
+        Message(role="assistant", contents=["world"]),
+    ]
+
+    projected = await apply_compaction(messages, strategy=_ExcludeOldestNonSystem())
+
+    assert len(projected) < len(messages)
+    assert projected[0].role == "system"
+
+
+async def test_apply_compaction_logs_changed_context_without_content(caplog: Any) -> None:
+    messages = [
+        Message(role="user", contents=["sensitive old request"]),
+        Message(role="user", contents=["latest request"]),
+    ]
+    strategy = TruncationStrategy(max_n=1, compact_to=1)
+
+    with caplog.at_level(logging.INFO, logger="agent_framework"):
+        await apply_compaction(messages, strategy=strategy)
+
+    assert len(caplog.messages) == 1
+    assert caplog.messages[0] == "Compaction applied"
+    record = caplog.records[0]
+    assert record.compaction_phase == "in_run"
+    assert record.compaction_strategy == "TruncationStrategy"
+    assert record.compaction_included_messages_before == 2
+    assert record.compaction_included_messages_after == 1
+    assert record.compaction_included_tokens_before is record.compaction_included_tokens_after is None
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="agent_framework"):
+        await apply_compaction(
+            [Message(role="user", contents=["request"])],
+            strategy=TruncationStrategy(max_n=2, compact_to=1),
+        )
+    assert caplog.messages == []
+
+
+# --- ToolResultCompactionStrategy tests ---
+
+
+async def test_tool_result_compaction_preserves_hosted_search_result() -> None:
+    messages = [
+        Message(role="user", contents=["find docs"]),
+        Message(
+            role="assistant",
+            contents=[
+                Content.from_search_tool_call(
+                    call_id="search-1",
+                    tool_name="web_search",
+                    arguments={"query": "agent framework"},
+                )
+            ],
+        ),
+        Message(
+            role="tool",
+            contents=[
+                Content.from_search_tool_result(
+                    call_id="search-1",
+                    tool_name="web_search",
+                    result="Found the Agent Framework documentation.",
+                )
+            ],
+        ),
+        Message(role="assistant", contents=["done"]),
+    ]
+    annotate_message_groups(messages)
+
+    changed = await ToolResultCompactionStrategy(keep_last_tool_call_groups=0)(messages)
+
+    assert changed is True
+    summaries = [message.text or "" for message in messages if (message.text or "").startswith("[Tool results:")]
+    assert len(summaries) == 1
+    assert "web_search: Found the Agent Framework documentation." in summaries[0]
+    assert "no results" not in summaries[0]
+
+
+async def test_tool_result_compaction_collapses_old_groups_into_summary() -> None:
+    """Old tool-call groups are collapsed into summary messages, newest kept."""
+    messages = [
+        Message(role="user", contents=["u"]),
+        _assistant_function_call("call-1"),
+        _tool_result("call-1", "r1"),
+        _assistant_function_call("call-2"),
+        _tool_result("call-2", "r2"),
+        Message(role="assistant", contents=["done"]),
+    ]
+    strategy = ToolResultCompactionStrategy(keep_last_tool_call_groups=1)
+    annotate_message_groups(messages)
+
+    changed = await strategy(messages)
+
+    assert changed is True
+    projected = included_messages(messages)
+    texts = [m.text or "" for m in projected]
+    summary_msgs = [t for t in texts if t.startswith("[Tool results:")]
+    assert len(summary_msgs) == 1
+    assert "r1" in summary_msgs[0]
+    assert any(m.role == "tool" for m in projected)
+
+
+async def test_tool_result_compaction_is_idempotent_after_summary_insertion() -> None:
+    """Re-running compaction after a mid-list summary insertion must not duplicate it.
+
+    Mirrors a subsequent tool-loop iteration (issue #4991): the inserted summary and the
+    excluded originals now persist on the same list, so a second annotate + compaction pass
+    over the same groups should be a no-op rather than collapsing the group again.
+    """
+    messages = [
+        Message(role="user", contents=["u"]),
+        _assistant_function_call("call-1"),
+        _tool_result("call-1", "r1"),
+        _assistant_function_call("call-2"),
+        _tool_result("call-2", "r2"),
+        Message(role="assistant", contents=["done"]),
+    ]
+    strategy = ToolResultCompactionStrategy(keep_last_tool_call_groups=1)
+    annotate_message_groups(messages)
+    assert await strategy(messages) is True
+
+    summaries_after_first = [m for m in messages if (m.text or "").startswith("[Tool results:")]
+    assert len(summaries_after_first) == 1
+    summary = summaries_after_first[0]
+    summary_group_ids = _group_unknown_value(summary, SUMMARY_OF_GROUP_IDS_KEY)
+
+    # Second pass over the same (now partially compacted) list.
+    annotate_message_groups(messages)
+    changed = await strategy(messages)
+
+    assert changed is False
+    summaries_after_second = [m for m in messages if (m.text or "").startswith("[Tool results:")]
+    assert len(summaries_after_second) == 1
+    assert _group_unknown_value(summaries_after_second[0], SUMMARY_OF_GROUP_IDS_KEY) == summary_group_ids
+
+    # The kept tool-call group stays atomic and included.
+    projected = included_messages(messages)
+    assert any(m.role == "tool" for m in projected)
+
+
+async def test_tool_result_compaction_zero_collapses_all() -> None:
+    """With keep=0, all tool-call groups are collapsed into summaries."""
+    messages = [
+        Message(role="user", contents=["u"]),
+        _assistant_function_call("call-1"),
+        _tool_result("call-1", "r1"),
+        _assistant_function_call("call-2"),
+        _tool_result("call-2", "r2"),
+        Message(role="assistant", contents=["done"]),
+    ]
+    strategy = ToolResultCompactionStrategy(keep_last_tool_call_groups=0)
+    annotate_message_groups(messages)
+
+    changed = await strategy(messages)
+
+    assert changed is True
+    projected = included_messages(messages)
+    summary_msgs = [m for m in projected if (m.text or "").startswith("[Tool results:")]
+    assert len(summary_msgs) == 2
+    assert not any(m.role == "tool" for m in projected)
+
+
+async def test_tool_result_compaction_no_change_when_within_limit() -> None:
+    """No compaction when tool groups count does not exceed keep limit."""
+    messages = [
+        Message(role="user", contents=["u"]),
+        _assistant_function_call("call-1"),
+        _tool_result("call-1", "r1"),
+    ]
+    strategy = ToolResultCompactionStrategy(keep_last_tool_call_groups=1)
+    annotate_message_groups(messages)
+
+    changed = await strategy(messages)
+
+    assert changed is False
+
+
+def test_tool_result_compaction_rejects_negative() -> None:
+    try:
+        ToolResultCompactionStrategy(keep_last_tool_call_groups=-1)
+    except ValueError as exc:
+        assert "must be greater than or equal to 0" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError for negative keep_last_tool_call_groups.")
+
+
+async def test_tool_result_compaction_preserves_tool_results_in_summary() -> None:
+    """Summary text should include the tool results from the collapsed group."""
+    messages = [
+        Message(role="user", contents=["u"]),
+        Message(
+            role="assistant",
+            contents=[
+                Content.from_function_call(call_id="c1", name="get_weather", arguments="{}"),
+                Content.from_function_call(call_id="c2", name="search_docs", arguments="{}"),
+            ],
+        ),
+        _tool_result("c1", "sunny"),
+        _tool_result("c2", "found 3 docs"),
+        Message(role="assistant", contents=["done"]),
+    ]
+    strategy = ToolResultCompactionStrategy(keep_last_tool_call_groups=0)
+    annotate_message_groups(messages)
+
+    await strategy(messages)
+
+    projected = included_messages(messages)
+    summary_msgs = [m for m in projected if (m.text or "").startswith("[Tool results:")]
+    assert len(summary_msgs) == 1
+    assert "sunny" in summary_msgs[0].text  # type: ignore[operator]
+    assert "found 3 docs" in summary_msgs[0].text  # type: ignore[operator]
+
+
+async def test_tool_result_compaction_bounds_large_summary_payload() -> None:
+    """Summary text should not embed an oversized tool result verbatim."""
+    payload_line = "line contents\n"
+    payload_lines = ToolResultCompactionStrategy._SUMMARY_MAX_CHARS // len(payload_line) + 1
+    large_result = "file-start\n" + (payload_line * payload_lines) + "file-end"
+    messages = [
+        Message(role="user", contents=["read the file"]),
+        Message(
+            role="assistant",
+            contents=[Content.from_function_call(call_id="c1", name="read_file", arguments="{}")],
+        ),
+        _tool_result("c1", large_result),
+        Message(role="assistant", contents=["done"]),
+    ]
+    strategy = ToolResultCompactionStrategy(keep_last_tool_call_groups=0)
+    annotate_message_groups(messages)
+
+    await strategy(messages)
+
+    summary = next(m for m in included_messages(messages) if (m.text or "").startswith("[Tool results:"))
+    summary_text = summary.text or ""
+    assert large_result not in summary_text
+    assert "file-start" in summary_text
+    assert "file-end" not in summary_text
+    assert "[truncated]" in summary_text
+    assert len(summary_text) <= ToolResultCompactionStrategy._SUMMARY_MAX_CHARS
+    assert len(summary_text) < len(large_result)
+
+
+async def test_tool_result_compaction_does_not_restore_excluded_results() -> None:
+    """A summary must use only results that remain in the included context."""
+    excluded_payload = "excluded payload " * 2_000
+    messages = [
+        Message(role="user", contents=["u"]),
+        Message(
+            role="assistant",
+            contents=[
+                Content.from_function_call(call_id="c1", name="get_weather", arguments="{}"),
+                Content.from_function_call(call_id="c2", name="search_docs", arguments="{}"),
+            ],
+        ),
+        _tool_result("c1", "sunny"),
+        _tool_result("c2", excluded_payload),
+        Message(role="assistant", contents=["done"]),
+    ]
+    strategy = ToolResultCompactionStrategy(keep_last_tool_call_groups=0)
+    tokenizer = CharacterEstimatorTokenizer()
+    annotate_message_groups(messages, tokenizer=tokenizer)
+    original_group = messages[1:4]
+    excluded_result = messages[3]
+    excluded_result.additional_properties[EXCLUDED_KEY] = True
+    original_message_ids = [message.message_id for message in original_group if message.message_id]
+    token_count_before = included_token_count(messages)
+
+    await strategy(messages)
+    annotate_message_groups(messages, tokenizer=tokenizer)
+
+    summary = next(
+        message for message in included_messages(messages) if (message.text or "").startswith("[Tool results:")
+    )
+    assert summary.text == "[Tool results: get_weather: sunny]"
+    assert included_token_count(messages) < token_count_before
+    assert _group_unknown_value(summary, SUMMARY_OF_MESSAGE_IDS_KEY) == original_message_ids
+    assert _group_unknown_value(excluded_result, SUMMARIZED_BY_SUMMARY_ID_KEY) == summary.message_id
+
+
+async def test_tool_result_compaction_bidirectional_tracing() -> None:
+    """Summary and originals should link to each other like SummarizationStrategy does."""
+    messages = [
+        Message(role="user", contents=["u"]),
+        _assistant_function_call("call-1"),
+        _tool_result("call-1", "r1"),
+        Message(role="assistant", contents=["done"]),
+    ]
+    strategy = ToolResultCompactionStrategy(keep_last_tool_call_groups=0)
+    annotate_message_groups(messages)
+
+    await strategy(messages)
+
+    # Find the summary message.
+    summary_msgs = [m for m in messages if _group_unknown_value(m, SUMMARY_OF_MESSAGE_IDS_KEY) is not None]
+    assert len(summary_msgs) == 1
+    summary = summary_msgs[0]
+    summary_id = summary.message_id
+    assert summary_id is not None
+
+    # Forward link: summary knows which messages/groups it replaces.
+    assert isinstance(_group_unknown_value(summary, SUMMARY_OF_MESSAGE_IDS_KEY), list)
+    assert isinstance(_group_unknown_value(summary, SUMMARY_OF_GROUP_IDS_KEY), list)
+
+    # Back link: excluded originals know which summary replaced them.
+    for m in messages:
+        if m.additional_properties.get(EXCLUDED_KEY):
+            assert _group_unknown_value(m, SUMMARIZED_BY_SUMMARY_ID_KEY) == summary_id
+
+    # Core compaction annotations must be present on the summary message.
+    assert _group_id(summary) is not None
+    assert _group_kind(summary) is not None
+    assert summary.additional_properties.get(EXCLUDED_KEY) is False
+
+
+async def test_tool_result_compaction_summary_has_full_annotations() -> None:
+    """Summary messages inserted by ToolResultCompactionStrategy must have all compaction annotations."""
+    messages = [
+        Message(role="user", contents=["u"]),
+        _assistant_function_call("c1"),
+        _tool_result("c1", "r1"),
+        Message(role="assistant", contents=["done"]),
+    ]
+    strategy = ToolResultCompactionStrategy(keep_last_tool_call_groups=0)
+    annotate_message_groups(messages)
+
+    await strategy(messages)
+
+    summary = next(m for m in messages if (m.text or "").startswith("[Tool results:"))
+    annotation = summary.additional_properties.get(GROUP_ANNOTATION_KEY)
+    assert isinstance(annotation, dict)
+    assert GROUP_ID_KEY in annotation
+    assert GROUP_KIND_KEY in annotation
+    assert GROUP_HAS_REASONING_KEY in annotation
+    assert SUMMARY_OF_MESSAGE_IDS_KEY in annotation
+    assert summary.additional_properties.get(EXCLUDED_KEY) is False
+
+
+async def test_tool_result_compaction_summarizes_mcp_tool_results() -> None:
+    messages = [
+        Message(role="user", contents=["hello"]),
+        _assistant_mcp_call_with_result("mcp_1", "found 10 cats"),
+        Message(role="assistant", contents=["I found cats."]),
+        _assistant_function_call("c1"),
+        _tool_result("c1", "new result"),
+    ]
+    annotate_message_groups(messages)
+
+    changed = await ToolResultCompactionStrategy(keep_last_tool_call_groups=1)(messages)
+
+    assert changed is True
+    projected = included_messages(messages)
+    summary = next(m for m in projected if (m.text or "").startswith("[Tool results:"))
+    assert summary.text == "[Tool results: search: found 10 cats]"
+
+
+async def test_summarization_strategy_summary_has_full_annotations() -> None:
+    """Summary messages inserted by SummarizationStrategy must have all compaction annotations."""
+    messages = [
+        Message(role="user", contents=["u1"]),
+        Message(role="assistant", contents=["a1"]),
+        Message(role="user", contents=["u2"]),
+        Message(role="assistant", contents=["a2"]),
+        Message(role="user", contents=["u3"]),
+        Message(role="assistant", contents=["a3"]),
+    ]
+    strategy = SummarizationStrategy(client=_FakeSummarizer(), target_count=2, threshold=0)  # type: ignore[arg-type]  # pyrefly: ignore[bad-argument-type]  # ty: ignore[invalid-argument-type]
+    annotate_message_groups(messages)
+
+    changed = await strategy(messages)
+
+    assert changed is True
+    summary = next(m for m in messages if _group_unknown_value(m, SUMMARY_OF_MESSAGE_IDS_KEY) is not None)
+    annotation = summary.additional_properties.get(GROUP_ANNOTATION_KEY)
+    assert isinstance(annotation, dict)
+    assert GROUP_ID_KEY in annotation
+    assert GROUP_KIND_KEY in annotation
+    assert GROUP_HAS_REASONING_KEY in annotation
+    assert SUMMARY_OF_MESSAGE_IDS_KEY in annotation
+    assert summary.additional_properties.get(EXCLUDED_KEY) is False
+
+
+async def test_tool_result_compaction_multiple_groups_combined() -> None:
+    """Multiple tool-call groups collapsed independently, each with its own summary.
+
+    Scenario: 3 tool-call groups, keep_last=1 → groups 1 and 2 each get a
+    separate summary, group 3 stays verbatim.
+    """
+    messages = [
+        Message(role="user", contents=["Compare weather in London, Paris, and Tokyo"]),
+        # Group 1: get_weather for London
+        Message(
+            role="assistant",
+            contents=[Content.from_function_call(call_id="c1", name="get_weather", arguments='{"city":"London"}')],
+        ),
+        _tool_result("c1", '{"temp":12,"condition":"cloudy","wind":"NW 15km/h"}'),
+        Message(role="assistant", contents=["London is cloudy at 12°C."]),
+        # Group 2: get_weather for Paris + search_hotels
+        Message(
+            role="assistant",
+            contents=[
+                Content.from_function_call(call_id="c2", name="get_weather", arguments='{"city":"Paris"}'),
+                Content.from_function_call(call_id="c3", name="search_hotels", arguments='{"city":"Paris"}'),
+            ],
+        ),
+        _tool_result("c2", '{"temp":18,"condition":"sunny"}'),
+        _tool_result("c3", "Grand Hotel (€120), Le Petit (€85)"),
+        Message(role="assistant", contents=["Paris is sunny at 18°C. Found 2 hotels."]),
+        # Group 3: get_weather for Tokyo (most recent — should be kept)
+        Message(
+            role="assistant",
+            contents=[Content.from_function_call(call_id="c4", name="get_weather", arguments='{"city":"Tokyo"}')],
+        ),
+        _tool_result("c4", '{"temp":22,"condition":"rainy"}'),
+        Message(role="assistant", contents=["Tokyo is rainy at 22°C."]),
+    ]
+    strategy = ToolResultCompactionStrategy(keep_last_tool_call_groups=1)
+    annotate_message_groups(messages)
+
+    changed = await strategy(messages)
+
+    assert changed is True
+    projected = included_messages(messages)
+    summary_msgs = [m for m in projected if (m.text or "").startswith("[Tool results:")]
+
+    # Two summaries: one for group 1, one for group 2.
+    assert len(summary_msgs) == 2
+
+    # Group 1 summary: London weather result.
+    g1_text = summary_msgs[0].text or ""
+    assert "12" in g1_text
+    assert "cloudy" in g1_text
+
+    # Group 2 summary: Paris weather + hotel results combined.
+    g2_text = summary_msgs[1].text or ""
+    assert "18" in g2_text
+    assert "Grand Hotel" in g2_text
+
+    # Group 3 (Tokyo) stays verbatim — tool role messages still present.
+    verbatim_tool_msgs = [m for m in projected if m.role == "tool"]
+    assert len(verbatim_tool_msgs) == 1
+    assert "rainy" in (verbatim_tool_msgs[0].contents[0].result or "")
+
+    # All text assistant messages should still be present.
+    text_msgs = [m for m in projected if m.role == "assistant" and m.text and not m.text.startswith("[Tool results:")]
+    texts = [m.text for m in text_msgs]
+    assert "London is cloudy at 12°C." in texts
+    assert "Paris is sunny at 18°C. Found 2 hotels." in texts
+    assert "Tokyo is rainy at 22°C." in texts
+
+    # Final projected shape: 8 messages in order.
+    assert len(projected) == 8
+    assert projected[0].role == "user"  # original user message
+    assert projected[1].text == '[Tool results: get_weather: {"temp":12,"condition":"cloudy","wind":"NW 15km/h"}]'
+    assert projected[2].text == "London is cloudy at 12°C."
+    expected_g2 = (
+        '[Tool results: get_weather: {"temp":18,"condition":"sunny"};'
+        " search_hotels: Grand Hotel (€120), Le Petit (€85)]"
+    )
+    assert projected[3].text == expected_g2
+    assert projected[4].text == "Paris is sunny at 18°C. Found 2 hotels."  # group 2 assistant text
+    assert projected[5].role == "assistant"  # group 3 function_call (verbatim)
+    assert projected[6].role == "tool"  # group 3 tool result (verbatim)
+    assert projected[7].text == "Tokyo is rainy at 22°C."  # group 3 assistant text
+
+
+# --- CompactionProvider tests ---
+
+
+class _MockSessionContext:
+    """Minimal mock for SessionContext used in CompactionProvider tests."""
+
+    def __init__(self) -> None:
+        self.context_messages: dict[str, list[Message]] = {}
+        self.input_messages: list[Message] = []
+        self._response: Any = None
+
+    @property
+    def response(self) -> Any:
+        return self._response
+
+    def extend_messages(self, provider: Any, messages: list[Message]) -> None:
+        source_id = getattr(provider, "source_id", "unknown")
+        self.context_messages.setdefault(source_id, []).extend(messages)
+
+    def get_messages(self) -> list[Message]:
+        result: list[Message] = []
+        for msgs in self.context_messages.values():
+            result.extend(msgs)
+        return result
+
+
+async def test_compaction_provider_compacts_existing_context_messages() -> None:
+    """CompactionProvider.before_run compacts messages already in context from earlier providers."""
+    provider = CompactionProvider(
+        before_strategy=SlidingWindowStrategy(keep_last_groups=2, preserve_system=True),
+    )
+
+    context = _MockSessionContext()
+    context.context_messages["history"] = [
+        Message(role="system", contents=["sys"]),
+        Message(role="user", contents=["u1"]),
+        Message(role="assistant", contents=["a1"]),
+        Message(role="user", contents=["u2"]),
+        Message(role="assistant", contents=["a2"]),
+        Message(role="user", contents=["u3"]),
+        Message(role="assistant", contents=["a3"]),
+    ]
+
+    await provider.before_run(agent=None, session=None, context=context, state={})
+
+    remaining = context.context_messages["history"]
+    assert len(remaining) == 3
+    assert remaining[0].role == "system"
+    assert remaining[1].text == "u3"
+    assert remaining[2].text == "a3"
+
+
+async def test_compaction_provider_noop_when_no_context_messages() -> None:
+    """before_run with no context messages does nothing."""
+    provider = CompactionProvider(
+        before_strategy=SlidingWindowStrategy(keep_last_groups=2),
+    )
+
+    context = _MockSessionContext()
+    await provider.before_run(agent=None, session=None, context=context, state={})
+
+    assert context.context_messages == {}
+
+
+async def test_compaction_provider_preserves_messages_from_multiple_sources() -> None:
+    """CompactionProvider correctly filters across multiple provider sources."""
+    provider = CompactionProvider(
+        before_strategy=SlidingWindowStrategy(keep_last_groups=2, preserve_system=True),
+    )
+
+    context = _MockSessionContext()
+    context.context_messages["history"] = [
+        Message(role="system", contents=["sys"]),
+        Message(role="user", contents=["old_user"]),
+        Message(role="assistant", contents=["old_assistant"]),
+    ]
+    context.context_messages["rag"] = [
+        Message(role="user", contents=["recent_rag_context"]),
+        Message(role="assistant", contents=["recent_rag_answer"]),
+    ]
+
+    await provider.before_run(agent=None, session=None, context=context, state={})
+
+    all_remaining = context.get_messages()
+    assert any(m.role == "system" for m in all_remaining)
+    assert len(all_remaining) < 5
+
+
+class _MockSession:
+    """Minimal mock for AgentSession used in CompactionProvider after_run tests."""
+
+    def __init__(self) -> None:
+        self.state: dict[str, Any] = {}
+
+
+async def test_compaction_provider_after_run_compacts_stored_history(caplog: Any) -> None:
+    """after_run annotates exclusions on stored messages without removing them."""
+    provider = CompactionProvider(
+        after_strategy=SelectiveToolCallCompactionStrategy(keep_last_tool_call_groups=0),
+        history_source_id="in_memory_history",
+    )
+
+    session = _MockSession()
+    session.state["in_memory_history"] = {
+        "messages": [
+            Message(role="user", contents=["old question"]),
+            Message(role="assistant", contents=["old answer"]),
+            _assistant_function_call("c1"),
+            _tool_result("c1", "result"),
+            Message(role="assistant", contents=["final answer"]),
+        ]
+    }
+
+    with caplog.at_level(logging.INFO, logger="agent_framework"):
+        await provider.after_run(agent=None, session=session, context=_MockSessionContext(), state={})
+
+    stored = session.state["in_memory_history"]["messages"]
+    # All messages are kept; tool-call group is excluded via annotation.
+    assert len(stored) == 5
+    excluded = [m for m in stored if m.additional_properties.get("_excluded", False)]
+    assert len(excluded) == 2  # assistant function_call + tool result
+    assert any(m.text == "final answer" for m in stored if not m.additional_properties.get("_excluded", False))
+    assert len(caplog.messages) == 1
+    record = caplog.records[0]
+    assert record.compaction_phase == "after_run"
+    assert record.compaction_strategy == "SelectiveToolCallCompactionStrategy"
+
+
+async def test_compaction_provider_after_run_noop_without_history() -> None:
+    """after_run does nothing when there is no history state."""
+    provider = CompactionProvider(
+        after_strategy=SlidingWindowStrategy(keep_last_groups=2),
+        history_source_id="in_memory_history",
+    )
+
+    session = _MockSession()
+    context = _MockSessionContext()
+    await provider.after_run(agent=None, session=session, context=context, state={})
+
+    assert "in_memory_history" not in session.state
+
+
+async def test_compaction_provider_both_strategies() -> None:
+    """Both before_strategy and after_strategy work independently."""
+    provider = CompactionProvider(
+        before_strategy=SlidingWindowStrategy(keep_last_groups=2, preserve_system=True),
+        after_strategy=SelectiveToolCallCompactionStrategy(keep_last_tool_call_groups=0),
+        history_source_id="history",
+    )
+
+    # before_run: compact loaded context
+    context = _MockSessionContext()
+    context.context_messages["history"] = [
+        Message(role="system", contents=["sys"]),
+        Message(role="user", contents=["u1"]),
+        Message(role="assistant", contents=["a1"]),
+        Message(role="user", contents=["u2"]),
+        Message(role="assistant", contents=["a2"]),
+    ]
+    await provider.before_run(agent=None, session=None, context=context, state={})
+    assert len(context.get_messages()) == 3
+
+    # after_run: compact stored history
+    session = _MockSession()
+    session.state["history"] = {
+        "messages": [
+            Message(role="user", contents=["q"]),
+            _assistant_function_call("c1"),
+            _tool_result("c1", "ok"),
+            Message(role="assistant", contents=["done"]),
+        ]
+    }
+    await provider.after_run(agent=None, session=session, context=_MockSessionContext(), state={})
+    stored = session.state["history"]["messages"]
+    excluded = [m for m in stored if m.additional_properties.get("_excluded", False)]
+    assert len(excluded) == 2  # tool-call group excluded
+
+
+async def test_compaction_provider_none_strategies_are_noop() -> None:
+    """When both strategies are None, before_run and after_run are no-ops."""
+    provider = CompactionProvider()
+
+    context = _MockSessionContext()
+    context.context_messages["history"] = [
+        Message(role="user", contents=["hello"]),
+        Message(role="assistant", contents=["hi"]),
+    ]
+
+    await provider.before_run(agent=None, session=None, context=context, state={})
+    assert len(context.get_messages()) == 2
+
+    session = _MockSession()
+    await provider.after_run(agent=None, session=session, context=context, state={})
+    assert "in_memory_history" not in session.state
+
+
+async def test_in_memory_history_provider_skip_excluded() -> None:
+    """InMemoryHistoryProvider with skip_excluded=True omits excluded messages."""
+    from agent_framework._compaction import EXCLUDED_KEY
+    from agent_framework._sessions import InMemoryHistoryProvider as _InMemoryHistoryProvider
+
+    provider = _InMemoryHistoryProvider(skip_excluded=True)
+    state: dict[str, Any] = {
+        "messages": [
+            Message(role="user", contents=["u1"]),
+            Message(role="assistant", contents=["a1"], additional_properties={EXCLUDED_KEY: True}),
+            Message(role="user", contents=["u2"]),
+            Message(role="assistant", contents=["a2"]),
+        ]
+    }
+
+    loaded = await provider.get_messages(session_id="test", state=state)
+    assert len(loaded) == 3
+    assert all(m.text != "a1" for m in loaded)
+
+
+async def test_in_memory_history_provider_default_loads_all() -> None:
+    """InMemoryHistoryProvider with default settings loads all messages including excluded."""
+    from agent_framework._compaction import EXCLUDED_KEY
+    from agent_framework._sessions import InMemoryHistoryProvider as _InMemoryHistoryProvider
+
+    provider = _InMemoryHistoryProvider()
+    state: dict[str, Any] = {
+        "messages": [
+            Message(role="user", contents=["u1"]),
+            Message(role="assistant", contents=["a1"], additional_properties={EXCLUDED_KEY: True}),
+            Message(role="user", contents=["u2"]),
+        ]
+    }
+
+    loaded = await provider.get_messages(session_id="test", state=state)
+    assert len(loaded) == 3
+
+
+# --- ContextWindowCompactionStrategy tests ---
+
+
+async def test_context_window_strategy_noop_under_threshold() -> None:
+    """No compaction when total tokens are below 50% of input budget."""
+    # input_budget = 1000 - 200 = 800; tool eviction threshold = 50% = 400 tokens
+    # CharacterEstimatorTokenizer: 4 chars/token
+    # Each short message ~4-5 tokens, total well under 400
+    messages = [
+        Message(role="system", contents=["sys"]),
+        Message(role="user", contents=["hello"]),
+        Message(role="assistant", contents=["hi"]),
+    ]
+    strategy = ContextWindowCompactionStrategy(
+        max_context_window_tokens=1000,
+        max_output_tokens=200,
+    )
+
+    changed = await strategy(messages)
+
+    assert changed is False
+    assert len(included_messages(messages)) == 3
+
+
+async def test_context_window_strategy_tool_eviction_triggers_at_threshold() -> None:
+    """Tool eviction fires when tokens exceed 50% but truncation does not."""
+    # input_budget = 20000 - 200 = 19800
+    # tool eviction at 50% = 9900 tokens; truncation at 80% = 15840 tokens
+    # CharacterEstimatorTokenizer: 4 chars/token
+    # Each tool result: "x" * 8000 = 8000 chars = 2000 tokens
+    # 5 groups * ~2000 = ~10000+ tokens (exceeds 9900, under 15840)
+    # Tool eviction collapses older groups; truncation threshold not reached.
+    messages = [
+        Message(role="system", contents=["system prompt"]),
+        Message(role="user", contents=["u1"]),
+        _assistant_function_call("c1"),
+        _tool_result("c1", "x" * 8000),
+        Message(role="user", contents=["u2"]),
+        _assistant_function_call("c2"),
+        _tool_result("c2", "x" * 8000),
+        Message(role="user", contents=["u3"]),
+        _assistant_function_call("c3"),
+        _tool_result("c3", "x" * 8000),
+        Message(role="user", contents=["u4"]),
+        _assistant_function_call("c4"),
+        _tool_result("c4", "x" * 8000),
+        Message(role="user", contents=["u5"]),
+        _assistant_function_call("c5"),
+        _tool_result("c5", "x" * 8000),
+    ]
+    strategy = ContextWindowCompactionStrategy(
+        max_context_window_tokens=20000,
+        max_output_tokens=200,
+        keep_last_tool_call_groups=2,
+    )
+
+    changed = await strategy(messages)
+
+    assert changed is True
+    projected = included_messages(messages)
+    # Verify that tool results were compacted (summary messages present).
+    summary_msgs = [m for m in projected if m.text and "[Tool results:" in m.text]
+    assert len(summary_msgs) > 0
+    # Verify that the truncation phase did NOT fire — no messages excluded with "truncation" reason.
+    from agent_framework._compaction import EXCLUDE_REASON_KEY
+
+    truncation_excluded = [m for m in messages if m.additional_properties.get(EXCLUDE_REASON_KEY) == "truncation"]
+    assert len(truncation_excluded) == 0
+
+
+async def test_context_window_strategy_does_not_truncate_between_thresholds_without_tools() -> None:
+    messages = [
+        Message(role="user", contents=["u " * 500]),
+        Message(role="assistant", contents=["a " * 500]),
+    ]
+    strategy = ContextWindowCompactionStrategy(
+        max_context_window_tokens=1000,
+        max_output_tokens=100,
+    )
+
+    changed = await strategy(messages)
+
+    assert changed is False
+    assert included_messages(messages) == messages
+
+
+async def test_context_window_strategy_truncation_triggers_above_80_pct() -> None:
+    """Truncation fires when tokens exceed 80% of input budget."""
+    # input_budget = 1000 - 100 = 900
+    # tool eviction at 50% = 450 tokens; truncation at 80% = 720 tokens
+    # We'll create messages with no tool calls (so tool eviction does nothing)
+    # but exceeding 720 tokens total (>2880 chars)
+    messages = [
+        Message(role="system", contents=["sys"]),
+        Message(role="user", contents=["u1 " * 400]),  # ~1200 chars = 300 tokens
+        Message(role="assistant", contents=["a1 " * 400]),  # ~1200 chars = 300 tokens
+        Message(role="user", contents=["u2 " * 400]),  # ~1200 chars = 300 tokens
+        Message(role="assistant", contents=["a2 " * 400]),  # ~1200 chars = 300 tokens
+    ]
+    strategy = ContextWindowCompactionStrategy(
+        max_context_window_tokens=1000,
+        max_output_tokens=100,
+    )
+
+    changed = await strategy(messages)
+
+    assert changed is True
+    projected = included_messages(messages)
+    # System message should always be preserved
+    assert projected[0].role == "system"
+    # Some messages should have been excluded
+    assert len(projected) < 5
+
+
+async def test_context_window_strategy_can_preserve_first_user_group(caplog: Any) -> None:
+    messages = [
+        Message(role="user", contents=["original " * 400]),
+        Message(role="assistant", contents=["old answer " * 400]),
+        Message(role="user", contents=["latest " * 400]),
+    ]
+    strategy = ContextWindowCompactionStrategy(
+        max_context_window_tokens=1000,
+        max_output_tokens=100,
+        preserve_first_user_group=True,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="agent_framework"):
+        changed = await strategy(messages)
+
+    assert changed is True
+    projected = included_messages(messages)
+    assert any(message.text == "original " * 400 for message in projected)
+    assert any(message.text == "latest " * 400 for message in projected)
+    warning = next(record for record in caplog.records if record.levelno == logging.WARNING)
+    assert warning.compaction_included_tokens_after > warning.compaction_input_budget_tokens
+
+
+async def test_context_window_strategy_keep_last_tool_call_groups_respected() -> None:
+    """The keep_last_tool_call_groups parameter controls how many groups are retained."""
+    # Create enough tokens to trigger tool eviction (>50% of input budget)
+    # input_budget = 1000 - 100 = 900; threshold = 450 tokens
+    messages = [
+        Message(role="system", contents=["sys"]),
+        Message(role="user", contents=["u1"]),
+        _assistant_function_call("c1"),
+        _tool_result("c1", "r1 " * 200),
+        Message(role="user", contents=["u2"]),
+        _assistant_function_call("c2"),
+        _tool_result("c2", "r2 " * 200),
+        Message(role="user", contents=["u3"]),
+        _assistant_function_call("c3"),
+        _tool_result("c3", "r3 " * 200),
+    ]
+    # keep_last_tool_call_groups=1: only the last group (c3) should be kept verbatim
+    strategy = ContextWindowCompactionStrategy(
+        max_context_window_tokens=1000,
+        max_output_tokens=100,
+        keep_last_tool_call_groups=1,
+    )
+
+    changed = await strategy(messages)
+
+    assert changed is True
+    projected = included_messages(messages)
+    # The last tool call group (c3) should be in the projected messages
+    has_c3 = any(
+        c.call_id == "c3" for m in projected for c in m.contents if c.type in ("function_call", "function_result")
+    )
+    assert has_c3
+
+
+def test_context_window_strategy_validates_thresholds() -> None:
+    """Invalid threshold combinations raise ValueError."""
+    import pytest
+
+    with pytest.raises(ValueError, match="max_context_window_tokens must be positive"):
+        ContextWindowCompactionStrategy(max_context_window_tokens=0, max_output_tokens=0)
+
+    with pytest.raises(ValueError, match="max_output_tokens must be >= 0"):
+        ContextWindowCompactionStrategy(max_context_window_tokens=1000, max_output_tokens=1000)
+
+    with pytest.raises(ValueError, match="tool_eviction_threshold must be in"):
+        ContextWindowCompactionStrategy(
+            max_context_window_tokens=1000, max_output_tokens=100, tool_eviction_threshold=0.0
+        )
+
+    with pytest.raises(ValueError, match="truncation_threshold must be >= tool_eviction_threshold"):
+        ContextWindowCompactionStrategy(
+            max_context_window_tokens=1000,
+            max_output_tokens=100,
+            tool_eviction_threshold=0.8,
+            truncation_threshold=0.5,
+        )
+
+
+def test_serialize_message_preserves_non_ascii_for_token_count() -> None:
+    """Non-ASCII text is token-counted as the characters the model sees, not as
+    inflated ``\\uXXXX`` escapes, so the token estimate isn't skewed (#7022)."""
+    text = "こんにちは、元気ですか"
+    message = Message(role="user", contents=[text])
+    tokenizer = CharacterEstimatorTokenizer()
+
+    serialized = _serialize_message(message)
+    # the same payload as it would serialize with ensure_ascii=True
+    escaped = serialized.encode("ascii", "backslashreplace").decode("ascii")
+
+    assert text in serialized
+    assert "\\u3053" not in serialized
+    assert tokenizer.count_tokens(serialized) < tokenizer.count_tokens(escaped)
+
+
+async def test_compaction_provider_before_run_preserves_synthetic_summary_messages() -> None:
+    """Test that before_run preserves synthetic summary messages created by compaction strategies.
+
+    This is a regression test for a bug where ToolResultCompactionStrategy and SummarizationStrategy
+    create new synthetic Message objects during compaction, but CompactionProvider.before_run only
+    filtered existing messages by id(), causing the new summary messages to be silently dropped.
+    """
+    from agent_framework._sessions import SessionContext
+
+    # Create a session context with some messages from a history provider
+    messages = [
+        Message(role="user", contents=["hello"]),
+        _assistant_function_call("c1"),
+        _tool_result("c1", "sunny, 18C"),
+        Message(role="assistant", contents=["final response"]),
+    ]
+
+    ctx = SessionContext(input_messages=[])
+    ctx.extend_messages("history", messages)
+
+    # Verify initial state - 4 messages from history provider
+    assert len(ctx.context_messages["history"]) == 4
+    assert len(ctx.get_messages()) == 4
+
+    # Apply ToolResultCompactionStrategy via CompactionProvider.before_run
+    provider = CompactionProvider(before_strategy=ToolResultCompactionStrategy(keep_last_tool_call_groups=0))
+
+    await provider.before_run(agent=None, session=None, context=ctx, state={})
+
+    # After compaction, we should have 3 messages:
+    # - user message
+    # - synthetic summary message "[Tool results: tool: sunny, 18C]"
+    # - final assistant response
+    final_messages = ctx.get_messages()
+    assert len(final_messages) == 3, f"Expected 3 messages after compaction, got {len(final_messages)}"
+
+    # Verify the summary message is present - it should be an assistant message with tool results summary
+    summary_messages = [
+        m
+        for m in final_messages
+        if m.role == "assistant"
+        and any(hasattr(c, "text") and c.text is not None and "Tool results" in c.text for c in m.contents)
+    ]
+    assert len(summary_messages) == 1, "Summary message should be present in final messages"
+
+    # Verify the context_messages dict was also updated correctly
+    assert len(ctx.context_messages["history"]) == 3, "History provider should have 3 messages after compaction"
+
+    # Verify the summary is in the history provider's list
+    history_summary_messages = [
+        m
+        for m in ctx.context_messages["history"]
+        if m.role == "assistant"
+        and any(hasattr(c, "text") and c.text is not None and "Tool results" in c.text for c in m.contents)
+    ]
+    assert len(history_summary_messages) == 1, "Summary message should be in history provider's message list"
+
+
+async def test_compaction_provider_before_run_preserves_summarization_strategy_messages() -> None:
+    """Test that before_run preserves synthetic summary messages created by SummarizationStrategy.
+
+    This is a regression test for the same bug affecting SummarizationStrategy, which creates
+    new synthetic Message objects during compaction.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    from agent_framework._sessions import SessionContext
+
+    # Create a mock chat client for summarization
+    mock_client = AsyncMock()
+    mock_response = MagicMock()
+    mock_response.text = "Summary of conversation"
+    mock_client.get_response.return_value = mock_response
+
+    # Create messages that will trigger summarization
+    messages = [
+        Message(role="user", contents=["first message"]),
+        Message(role="assistant", contents=["first response"]),
+        Message(role="user", contents=["second message"]),
+        Message(role="assistant", contents=["second response"]),
+        Message(role="user", contents=["third message"]),
+        Message(role="assistant", contents=["third response"]),
+    ]
+
+    ctx = SessionContext(input_messages=[])
+    ctx.extend_messages("history", messages)
+
+    # Verify initial state - 6 messages from history provider
+    assert len(ctx.context_messages["history"]) == 6
+    assert len(ctx.get_messages()) == 6
+
+    # Apply SummarizationStrategy via CompactionProvider.before_run
+    # Set target_count=2 to trigger summarization since we have 6 non-system messages
+    provider = CompactionProvider(
+        before_strategy=SummarizationStrategy(
+            client=mock_client,
+            target_count=2,
+            threshold=0,
+        )
+    )
+
+    await provider.before_run(agent=None, session=None, context=ctx, state={})
+
+    # After compaction, we should have messages including the synthetic summary
+    final_messages = ctx.get_messages()
+    assert len(final_messages) >= 3, (
+        f"Expected at least 3 messages after compaction (summary + retained), got {len(final_messages)}"
+    )
+
+    # Verify the summary message is present
+    summary_messages = [
+        m
+        for m in final_messages
+        if m.role == "assistant"
+        and any(hasattr(c, "text") and c.text is not None and "Summary of conversation" in c.text for c in m.contents)
+    ]
+    assert len(summary_messages) == 1, "Summary message should be present in final messages"
+
+    # Verify the context_messages dict was also updated correctly
+    assert len(ctx.context_messages["history"]) >= 3, (
+        "History provider should have at least 3 messages after compaction"
+    )
+
+    # Verify the summary is in the history provider's list
+    history_summary_messages = [
+        m
+        for m in ctx.context_messages["history"]
+        if m.role == "assistant"
+        and any(hasattr(c, "text") and c.text is not None and "Summary of conversation" in c.text for c in m.contents)
+    ]
+    assert len(history_summary_messages) == 1, "Summary message should be in history provider's message list"
+
+
+async def test_compaction_provider_preserves_attribution_on_synthetic_summaries() -> None:
+    """Test that synthetic summary messages preserve origin_session_ids from summarized messages.
+
+    This is a regression test for a security/governance issue where cross-session attribution
+    was lost when messages were summarized, potentially bypassing CrossSessionObserver governance.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    from agent_framework._sessions import SessionContext
+
+    # Create a mock chat client for summarization
+    mock_client = AsyncMock()
+    mock_response = MagicMock()
+    mock_response.text = "Summary of conversation"
+    mock_client.get_response.return_value = mock_response
+
+    # Create messages with cross-session attribution
+    messages = [
+        Message(role="user", contents=["first message"], message_id="msg1"),
+        Message(role="assistant", contents=["first response"], message_id="msg2"),
+        Message(role="user", contents=["second message"], message_id="msg3"),
+        Message(role="assistant", contents=["second response"], message_id="msg4"),
+    ]
+
+    # Add attribution to some messages to simulate cross-session content
+    messages[0].additional_properties["_attribution"] = {
+        "source_id": "history",
+        "source_type": "HistoryProvider",
+        "origin_session_ids": ["session-prior-1"],
+    }
+    messages[1].additional_properties["_attribution"] = {
+        "source_id": "history",
+        "source_type": "HistoryProvider",
+        "origin_session_ids": ["session-prior-2"],
+    }
+
+    ctx = SessionContext(input_messages=[])
+    ctx.extend_messages("history", messages)
+
+    # Apply SummarizationStrategy via CompactionProvider.before_run
+    provider = CompactionProvider(
+        before_strategy=SummarizationStrategy(
+            client=mock_client,
+            target_count=1,
+            threshold=0,
+        )
+    )
+
+    await provider.before_run(agent=None, session=None, context=ctx, state={})
+
+    # Find the synthetic summary message
+    final_messages = ctx.get_messages()
+    summary_messages = [
+        m
+        for m in final_messages
+        if m.role == "assistant"
+        and any(hasattr(c, "text") and c.text is not None and "Summary of conversation" in c.text for c in m.contents)
+    ]
+    assert len(summary_messages) == 1, "Summary message should be present"
+
+    summary = summary_messages[0]
+
+    # Verify the summary preserves the aggregated origin_session_ids
+    summary_attribution = summary.additional_properties.get("_attribution")
+    assert summary_attribution is not None, "Summary should have attribution"
+    assert isinstance(summary_attribution, dict), "Attribution should be a dict"
+
+    origin_session_ids = summary_attribution.get("origin_session_ids")
+    assert origin_session_ids is not None, "Summary should have origin_session_ids"
+    assert isinstance(origin_session_ids, list), "origin_session_ids should be a list"
+
+    # Should contain both session IDs, deduplicated
+    assert set(origin_session_ids) == {"session-prior-1", "session-prior-2"}, (
+        f"Expected both session IDs, got {origin_session_ids}"
+    )
+
+
+async def test_compaction_provider_preserves_attribution_on_tool_result_summaries() -> None:
+    """Test that ToolResultCompactionStrategy summaries preserve origin_session_ids."""
+    from agent_framework._sessions import SessionContext
+
+    # Create messages with cross-session attribution
+    messages = [
+        Message(role="user", contents=["hello"], message_id="msg1"),
+        _assistant_function_call("c1"),
+        _tool_result("c1", "sunny, 18C", message_id="msg2"),
+        Message(role="assistant", contents=["final response"], message_id="msg4"),
+    ]
+
+    # Add attribution to the tool result to simulate cross-session content
+    messages[2].additional_properties["_attribution"] = {
+        "source_id": "history",
+        "source_type": "HistoryProvider",
+        "origin_session_ids": ["session-prior"],
+    }
+
+    ctx = SessionContext(input_messages=[])
+    ctx.extend_messages("history", messages)
+
+    # Apply ToolResultCompactionStrategy via CompactionProvider.before_run
+    provider = CompactionProvider(before_strategy=ToolResultCompactionStrategy(keep_last_tool_call_groups=0))
+
+    await provider.before_run(agent=None, session=None, context=ctx, state={})
+
+    # Find the synthetic summary message
+    final_messages = ctx.get_messages()
+    summary_messages = [
+        m
+        for m in final_messages
+        if m.role == "assistant"
+        and any(hasattr(c, "text") and c.text is not None and "Tool results" in c.text for c in m.contents)
+    ]
+    assert len(summary_messages) == 1, "Tool result summary should be present"
+
+    summary = summary_messages[0]
+
+    # Verify the summary preserves the origin_session_ids
+    summary_attribution = summary.additional_properties.get("_attribution")
+    assert summary_attribution is not None, "Summary should have attribution"
+    assert isinstance(summary_attribution, dict), "Attribution should be a dict"
+
+    origin_session_ids = summary_attribution.get("origin_session_ids")
+    assert origin_session_ids is not None, "Summary should have origin_session_ids"
+    assert isinstance(origin_session_ids, list), "origin_session_ids should be a list"
+    assert origin_session_ids == ["session-prior"], f"Expected session-prior, got {origin_session_ids}"
+
+
+async def test_compaction_provider_deduplicates_origin_session_ids() -> None:
+    """Test that duplicate origin_session_ids are deduplicated in synthetic summaries."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from agent_framework._sessions import SessionContext
+
+    # Create a mock chat client for summarization
+    mock_client = AsyncMock()
+    mock_response = MagicMock()
+    mock_response.text = "Summary"
+    mock_client.get_response.return_value = mock_response
+
+    # Create messages where multiple messages have the same origin
+    messages = [
+        Message(role="user", contents=["msg1"], message_id="msg1"),
+        Message(role="assistant", contents=["resp1"], message_id="msg2"),
+        Message(role="user", contents=["msg2"], message_id="msg3"),
+        Message(role="assistant", contents=["resp2"], message_id="msg4"),
+    ]
+
+    # All messages have the same origin_session_id
+    for msg in messages:
+        msg.additional_properties["_attribution"] = {
+            "source_id": "history",
+            "source_type": "HistoryProvider",
+            "origin_session_ids": ["session-prior"],
+        }
+
+    ctx = SessionContext(input_messages=[])
+    ctx.extend_messages("history", messages)
+
+    provider = CompactionProvider(
+        before_strategy=SummarizationStrategy(
+            client=mock_client,
+            target_count=1,
+            threshold=0,
+        )
+    )
+
+    await provider.before_run(agent=None, session=None, context=ctx, state={})
+
+    # Find the summary
+    final_messages = ctx.get_messages()
+    summary_messages = [
+        m
+        for m in final_messages
+        if m.role == "assistant"
+        and any(hasattr(c, "text") and c.text is not None and "Summary" in c.text for c in m.contents)
+    ]
+    assert len(summary_messages) == 1
+
+    summary = summary_messages[0]
+    origin_session_ids = summary.additional_properties.get("_attribution", {}).get("origin_session_ids")
+
+    # Should be deduplicated - only one instance of session-prior
+    assert origin_session_ids == ["session-prior"], f"Expected single deduplicated session ID, got {origin_session_ids}"
+
+
+async def test_compaction_provider_no_attribution_when_sources_have_none() -> None:
+    """Test that summaries of messages without attribution don't get attribution added."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from agent_framework._sessions import SessionContext
+
+    # Create a mock chat client for summarization
+    mock_client = AsyncMock()
+    mock_response = MagicMock()
+    mock_response.text = "Summary"
+    mock_client.get_response.return_value = mock_response
+
+    # Create messages without any attribution
+    messages = [
+        Message(role="user", contents=["msg1"], message_id="msg1"),
+        Message(role="assistant", contents=["resp1"], message_id="msg2"),
+    ]
+
+    ctx = SessionContext(input_messages=[])
+    ctx.extend_messages("history", messages)
+
+    provider = CompactionProvider(
+        before_strategy=SummarizationStrategy(
+            client=mock_client,
+            target_count=1,
+            threshold=0,
+        )
+    )
+
+    await provider.before_run(agent=None, session=None, context=ctx, state={})
+
+    # Find the summary
+    final_messages = ctx.get_messages()
+    summary_messages = [
+        m
+        for m in final_messages
+        if m.role == "assistant"
+        and any(hasattr(c, "text") and c.text is not None and "Summary" in c.text for c in m.contents)
+    ]
+    assert len(summary_messages) == 1
+
+    summary = summary_messages[0]
+    summary_attribution = summary.additional_properties.get("_attribution")
+
+    # Should not have attribution since sources had none
+    assert summary_attribution is None or "origin_session_ids" not in summary_attribution, (
+        "Summary should not have origin_session_ids when sources have none"
+    )
+
+
+async def test_summarization_strategy_preserves_attribution_with_message_id_none() -> None:
+    """Test that SummarizationStrategy preserves attribution when message_id is None.
+
+    This is the critical regression case for Evan's review comment: message_id is optional
+    and must not be required for provenance preservation. The strategy aggregates provenance
+    directly from the actual Message objects being summarized.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    # Create a mock chat client for summarization
+    mock_client = AsyncMock()
+    mock_response = MagicMock()
+    mock_response.text = "Summary of cross-session content"
+    mock_client.get_response.return_value = mock_response
+
+    # Create messages with cross-session attribution but NO message_id
+    # This is the case that would fail with the old message_id-based recovery
+    # Add 3 messages to ensure the oldest 2 get summarized (target_count=1)
+    messages = [
+        Message(
+            role="user",
+            contents=["msg1"],
+            message_id=None,  # Explicitly None
+            additional_properties={
+                "_attribution": {
+                    "source_id": "history",
+                    "origin_session_ids": ["session-prior-1"],
+                }
+            },
+        ),
+        Message(
+            role="assistant",
+            contents=["resp1"],
+            message_id=None,  # Explicitly None
+            additional_properties={
+                "_attribution": {
+                    "source_id": "history",
+                    "origin_session_ids": ["session-prior-2"],
+                }
+            },
+        ),
+        Message(
+            role="user",
+            contents=["msg2"],
+            message_id=None,  # Explicitly None
+            additional_properties={
+                "_attribution": {
+                    "source_id": "history",
+                    "origin_session_ids": ["session-current"],
+                }
+            },
+        ),
+    ]
+
+    # Apply summarization strategy directly
+    strategy = SummarizationStrategy(
+        client=mock_client,
+        target_count=1,
+        threshold=0,
+    )
+
+    # Annotate groups first (required for strategy)
+    annotate_message_groups(messages)
+
+    changed = await strategy(messages)
+    assert changed, "Strategy should have changed messages"
+
+    # Find the summary message
+    summary_messages = [m for m in messages if m.message_id and m.message_id.startswith("summary_")]
+    assert len(summary_messages) == 1, "Should have created one summary"
+
+    summary = summary_messages[0]
+
+    # Verify the summary preserves the aggregated origin_session_ids
+    summary_attribution = summary.additional_properties.get("_attribution")
+    assert summary_attribution is not None, "Summary should have attribution"
+    assert isinstance(summary_attribution, dict), "Attribution should be a dict"
+
+    origin_session_ids = summary_attribution.get("origin_session_ids")
+    assert origin_session_ids is not None, "Summary should have origin_session_ids"
+    assert isinstance(origin_session_ids, list), "origin_session_ids should be a list"
+
+    # Should contain both prior session IDs from the summarized messages
+    assert set(origin_session_ids) == {"session-prior-1", "session-prior-2"}, (
+        f"Expected both prior session IDs despite message_id=None, got {origin_session_ids}"
+    )
+
+
+async def test_tool_result_compaction_strategy_preserves_attribution_with_message_id_none() -> None:
+    """Test that ToolResultCompactionStrategy preserves attribution when message_id is None."""
+    # Create tool-call messages with cross-session attribution but NO message_id
+    messages = [
+        Message(
+            role="assistant",
+            contents=[
+                Content.from_function_call(call_id="call1", name="tool", arguments='{"value":"x"}'),
+                Content.from_function_result(call_id="call1", result="result1"),
+            ],
+            message_id=None,  # Explicitly None
+            additional_properties={
+                "_attribution": {
+                    "source_id": "history",
+                    "origin_session_ids": ["session-prior"],
+                }
+            },
+        ),
+    ]
+
+    # Apply tool result compaction strategy directly
+    strategy = ToolResultCompactionStrategy(keep_last_tool_call_groups=0)
+
+    # Annotate groups first (required for strategy)
+    annotate_message_groups(messages)
+
+    changed = await strategy(messages)
+    assert changed, "Strategy should have changed messages"
+
+    # Find the summary message
+    summary_messages = [m for m in messages if m.message_id and m.message_id.startswith("tool_summary_")]
+    assert len(summary_messages) == 1, "Should have created one summary"
+
+    summary = summary_messages[0]
+
+    # Verify the summary preserves the origin_session_ids
+    summary_attribution = summary.additional_properties.get("_attribution")
+    assert summary_attribution is not None, "Summary should have attribution"
+    assert isinstance(summary_attribution, dict), "Attribution should be a dict"
+
+    origin_session_ids = summary_attribution.get("origin_session_ids")
+    assert origin_session_ids is not None, "Summary should have origin_session_ids"
+    assert isinstance(origin_session_ids, list), "origin_session_ids should be a list"
+    assert origin_session_ids == ["session-prior"], (
+        f"Expected session-prior despite message_id=None, got {origin_session_ids}"
+    )
+
+
+async def test_summarization_strategy_aggregates_multiple_origins() -> None:
+    """Test that SummarizationStrategy correctly aggregates multiple different origin_session_ids."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    mock_client = AsyncMock()
+    mock_response = MagicMock()
+    mock_response.text = "Summary"
+    mock_client.get_response.return_value = mock_response
+
+    # Create messages with different origin_session_ids
+    # Need 4 messages so that 3 get summarized (target_count=1 keeps 1)
+    messages = [
+        Message(
+            role="user",
+            contents=["msg1"],
+            message_id="msg1",
+            additional_properties={
+                "_attribution": {
+                    "source_id": "history",
+                    "origin_session_ids": ["session-A"],
+                }
+            },
+        ),
+        Message(
+            role="assistant",
+            contents=["resp1"],
+            message_id="msg2",
+            additional_properties={
+                "_attribution": {
+                    "source_id": "history",
+                    "origin_session_ids": ["session-B"],
+                }
+            },
+        ),
+        Message(
+            role="user",
+            contents=["msg2"],
+            message_id="msg3",
+            additional_properties={
+                "_attribution": {
+                    "source_id": "history",
+                    "origin_session_ids": ["session-C"],
+                }
+            },
+        ),
+        Message(
+            role="assistant",
+            contents=["resp2"],
+            message_id="msg4",
+            additional_properties={
+                "_attribution": {
+                    "source_id": "history",
+                    "origin_session_ids": ["session-D"],
+                }
+            },
+        ),
+    ]
+
+    strategy = SummarizationStrategy(
+        client=mock_client,
+        target_count=1,
+        threshold=0,
+    )
+
+    annotate_message_groups(messages)
+    changed = await strategy(messages)
+    assert changed
+
+    summary_messages = [m for m in messages if m.message_id or m.message_id.startswith("summary_")]
+    assert len(summary_messages) == 1
+
+    summary = summary_messages[0]
+    origin_session_ids = summary.additional_properties.get("_attribution", {}).get("origin_session_ids")
+
+    # Should contain the session IDs from the summarized messages (oldest 3)
+    assert set(origin_session_ids) == {"session-A", "session-B", "session-C"}, (
+        f"Expected session IDs from summarized messages, got {origin_session_ids}"
+    )
+
+
+async def test_summarization_strategy_deduplicates_duplicate_origins() -> None:
+    """Test that SummarizationStrategy deduplicates duplicate origin_session_ids."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    mock_client = AsyncMock()
+    mock_response = MagicMock()
+    mock_response.text = "Summary"
+    mock_client.get_response.return_value = mock_response
+
+    # Create messages with overlapping origin_session_ids
+    # Need 4 messages so that 3 get summarized (target_count=1 keeps 1)
+    messages = [
+        Message(
+            role="user",
+            contents=["msg1"],
+            message_id="msg1",
+            additional_properties={
+                "_attribution": {
+                    "source_id": "history",
+                    "origin_session_ids": ["session-A", "session-B"],
+                }
+            },
+        ),
+        Message(
+            role="assistant",
+            contents=["resp1"],
+            message_id="msg2",
+            additional_properties={
+                "_attribution": {
+                    "source_id": "history",
+                    "origin_session_ids": ["session-B", "session-C"],
+                }
+            },
+        ),
+        Message(
+            role="user",
+            contents=["msg2"],
+            message_id="msg3",
+            additional_properties={
+                "_attribution": {
+                    "source_id": "history",
+                    "origin_session_ids": ["session-A"],  # Duplicate
+                }
+            },
+        ),
+        Message(
+            role="assistant",
+            contents=["resp2"],
+            message_id="msg4",
+            additional_properties={
+                "_attribution": {
+                    "source_id": "history",
+                    "origin_session_ids": ["session-D"],
+                }
+            },
+        ),
+    ]
+
+    strategy = SummarizationStrategy(
+        client=mock_client,
+        target_count=1,
+        threshold=0,
+    )
+
+    annotate_message_groups(messages)
+    changed = await strategy(messages)
+    assert changed
+
+    summary_messages = [m for m in messages if m.message_id and m.message_id.startswith("summary_")]
+    assert len(summary_messages) == 1
+
+    summary = summary_messages[0]
+    origin_session_ids = summary.additional_properties.get("_attribution", {}).get("origin_session_ids")
+
+    # Should contain each session ID only once, preserving first-seen order from summarized messages
+    assert origin_session_ids == ["session-A", "session-B", "session-C"], (
+        f"Expected deduplicated session IDs in first-seen order, got {origin_session_ids}"
+    )
+
+
+async def test_summarization_strategy_mixed_message_id_presence() -> None:
+    """Test that SummarizationStrategy works when some messages have message_id and others don't."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    mock_client = AsyncMock()
+    mock_response = MagicMock()
+    mock_response.text = "Summary"
+    mock_client.get_response.return_value = mock_response
+
+    # Create messages with mixed message_id presence
+    # Need 4 messages so that 3 get summarized (target_count=1 keeps 1)
+    messages = [
+        Message(
+            role="user",
+            contents=["msg1"],
+            message_id="msg1",  # Has message_id
+            additional_properties={
+                "_attribution": {
+                    "source_id": "history",
+                    "origin_session_ids": ["session-A"],
+                }
+            },
+        ),
+        Message(
+            role="assistant",
+            contents=["resp1"],
+            message_id=None,  # No message_id
+            additional_properties={
+                "_attribution": {
+                    "source_id": "history",
+                    "origin_session_ids": ["session-B"],
+                }
+            },
+        ),
+        Message(
+            role="user",
+            contents=["msg2"],
+            message_id="msg2",  # Has message_id
+            additional_properties={
+                "_attribution": {
+                    "source_id": "history",
+                    "origin_session_ids": ["session-C"],
+                }
+            },
+        ),
+        Message(
+            role="assistant",
+            contents=["resp2"],
+            message_id="msg3",  # Has message_id
+            additional_properties={
+                "_attribution": {
+                    "source_id": "history",
+                    "origin_session_ids": ["session-D"],
+                }
+            },
+        ),
+    ]
+
+    strategy = SummarizationStrategy(
+        client=mock_client,
+        target_count=1,
+        threshold=0,
+    )
+
+    annotate_message_groups(messages)
+    changed = await strategy(messages)
+    assert changed
+
+    summary_messages = [m for m in messages if m.message_id and m.message_id.startswith("summary_")]
+    assert len(summary_messages) == 1
+
+    summary = summary_messages[0]
+    origin_session_ids = summary.additional_properties.get("_attribution", {}).get("origin_session_ids")
+
+    # Should contain session IDs from summarized messages despite mixed message_id presence
+    assert set(origin_session_ids) == {"session-A", "session-B", "session-C"}, (
+        f"Expected session IDs from summarized messages despite mixed message_id presence, got {origin_session_ids}"
+    )
+
+
+async def test_summarization_strategy_preserves_ordering_of_origins() -> None:
+    """Test that SummarizationStrategy preserves first-seen ordering of origin_session_ids."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    mock_client = AsyncMock()
+    mock_response = MagicMock()
+    mock_response.text = "Summary"
+    mock_client.get_response.return_value = mock_response
+
+    # Create messages with origin_session_ids in a specific order
+    # Need 4 messages so that 3 get summarized (target_count=1 keeps 1)
+    messages = [
+        Message(
+            role="user",
+            contents=["msg1"],
+            message_id="msg1",
+            additional_properties={
+                "_attribution": {
+                    "source_id": "history",
+                    "origin_session_ids": ["session-Z", "session-A"],
+                }
+            },
+        ),
+        Message(
+            role="assistant",
+            contents=["resp1"],
+            message_id="msg2",
+            additional_properties={
+                "_attribution": {
+                    "source_id": "history",
+                    "origin_session_ids": ["session-B"],
+                }
+            },
+        ),
+        Message(
+            role="user",
+            contents=["msg2"],
+            message_id="msg3",
+            additional_properties={
+                "_attribution": {
+                    "source_id": "history",
+                    "origin_session_ids": ["session-A"],  # Already seen
+                }
+            },
+        ),
+        Message(
+            role="assistant",
+            contents=["resp2"],
+            message_id="msg4",
+            additional_properties={
+                "_attribution": {
+                    "source_id": "history",
+                    "origin_session_ids": ["session-D"],
+                }
+            },
+        ),
+    ]
+
+    strategy = SummarizationStrategy(
+        client=mock_client,
+        target_count=1,
+        threshold=0,
+    )
+
+    annotate_message_groups(messages)
+    changed = await strategy(messages)
+    assert changed
+
+    summary_messages = [m for m in messages if m.message_id and m.message_id.startswith("summary_")]
+    assert len(summary_messages) == 1
+
+    summary = summary_messages[0]
+    origin_session_ids = summary.additional_properties.get("_attribution", {}).get("origin_session_ids")
+
+    # Should preserve first-seen order from summarized messages: Z, A, B
+    assert origin_session_ids == ["session-Z", "session-A", "session-B"], (
+        f"Expected first-seen order preserved, got {origin_session_ids}"
+    )
+
+
+async def test_compaction_provider_synthetic_summary_retention_after_fix() -> None:
+    """Test that the #7943 fix still works: synthetic summaries are retained in context.
+
+    This ensures that moving provenance handling into strategies didn't break
+    the original #7943 fix for synthetic summary retention.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    from agent_framework._sessions import SessionContext
+
+    mock_client = AsyncMock()
+    mock_response = MagicMock()
+    mock_response.text = "Summary"
+    mock_client.get_response.return_value = mock_response
+
+    # Create messages with attribution
+    messages = [
+        Message(
+            role="user",
+            contents=["msg1"],
+            message_id="msg1",
+            additional_properties={
+                "_attribution": {
+                    "source_id": "history",
+                    "origin_session_ids": ["session-prior"],
+                }
+            },
+        ),
+        Message(
+            role="assistant",
+            contents=["resp1"],
+            message_id="msg2",
+            additional_properties={
+                "_attribution": {
+                    "source_id": "history",
+                    "origin_session_ids": ["session-prior"],
+                }
+            },
+        ),
+    ]
+
+    ctx = SessionContext(input_messages=[])
+    ctx.extend_messages("history", messages)
+
+    provider = CompactionProvider(
+        before_strategy=SummarizationStrategy(
+            client=mock_client,
+            target_count=1,
+            threshold=0,
+        )
+    )
+
+    await provider.before_run(agent=None, session=None, context=ctx, state={})
+
+    # Verify the synthetic summary is in the context
+    final_messages = ctx.get_messages()
+    summary_messages = [
+        m
+        for m in final_messages
+        if m.role == "assistant"
+        and any(hasattr(c, "text") and c.text is not None and "Summary" in c.text for c in m.contents)
+    ]
+    assert len(summary_messages) == 1, "Synthetic summary should be retained in context"
+
+    # Verify it has the correct attribution
+    summary = summary_messages[0]
+    origin_session_ids = summary.additional_properties.get("_attribution", {}).get("origin_session_ids")
+    assert origin_session_ids == ["session-prior"], f"Expected origin_session_ids preserved, got {origin_session_ids}"

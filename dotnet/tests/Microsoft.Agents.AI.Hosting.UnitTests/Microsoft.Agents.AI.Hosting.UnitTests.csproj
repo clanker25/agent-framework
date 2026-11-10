@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>$(TargetFrameworksCore)</TargetFrameworks>
+    <InjectSharedUnitTestCode>true</InjectSharedUnitTestCode>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Microsoft.Agents.AI.Hosting\Microsoft.Agents.AI.Hosting.csproj" />
+    <ProjectReference Include="..\..\src\Microsoft.Agents.AI.Hosting.AspNetCore\Microsoft.Agents.AI.Hosting.AspNetCore.csproj" />
+  </ItemGroup>
+
+</Project>
