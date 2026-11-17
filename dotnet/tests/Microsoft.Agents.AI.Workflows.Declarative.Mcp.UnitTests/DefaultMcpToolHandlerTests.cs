@@ -1,0 +1,602 @@
+﻿// Copyright (c) Microsoft. All rights reserved.
+
+using System;
+using System.Collections.Generic;
+using System.Net.Http;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.AI;
+using ModelContextProtocol.Protocol;
+using Moq;
+
+namespace Microsoft.Agents.AI.Workflows.Declarative.Mcp.UnitTests;
+
+/// <summary>
+/// Unit tests for <see cref="DefaultMcpToolHandler"/>.
+/// </summary>
+public sealed class DefaultMcpToolHandlerTests
+{
+    [Fact]
+    public void Constructor_WithNullHttpMessageHandlerFactory_ShouldThrow()
+    {
+        // Act
+        ArgumentNullException exception = Assert.Throws<ArgumentNullException>(() => new DefaultMcpToolHandler(["example.com"], null!, "workflow-mcp"));
+
+        // Assert
+        Assert.Equal("httpMessageHandlerFactory", exception.ParamName);
+    }
+
+    [Fact]
+    public void Constructor_WithNullHttpClientName_ShouldThrow()
+    {
+        // Arrange
+        Mock<IHttpMessageHandlerFactory> factory = new();
+
+        // Act
+        ArgumentNullException exception = Assert.Throws<ArgumentNullException>(() => new DefaultMcpToolHandler(["example.com"], factory.Object, null!));
+
+        // Assert
+        Assert.Equal("httpClientName", exception.ParamName);
+    }
+
+    [Theory]
+    [InlineData("\r", false)]
+    [InlineData("\n", false)]
+    [InlineData("\0", false)]
+    [InlineData("\r", true)]
+    [InlineData("\n", true)]
+    [InlineData("\0", true)]
+    public async Task InvokeToolAsync_WithInvalidHeader_ShouldRejectBeforeClientCreationAsync(
+        string invalidCharacter,
+        bool invalidName)
+    {
+        // Arrange
+        Mock<IHttpMessageHandlerFactory> factory = new(MockBehavior.Strict);
+        DefaultMcpToolHandler handler = new(["example.com"], factory.Object, "workflow-mcp");
+        Dictionary<string, string> headers = new()
+        {
+            [invalidName ? $"X-Test{invalidCharacter}" : "X-Test"] = invalidName ? "value" : $"value{invalidCharacter}"
+        };
+
+        // Act
+        ArgumentException exception = await Assert.ThrowsAsync<ArgumentException>(() => handler.InvokeToolAsync(
+            "https://example.com/mcp", null, "ping", null, headers, null));
+
+        // Assert
+        Assert.Equal("headers", exception.ParamName);
+        factory.Verify(f => f.CreateHandler(It.IsAny<string>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task InvokeToolAsync_WithCancelledToken_ShouldRejectBeforeClientCreationAsync()
+    {
+        // Arrange
+        Mock<IHttpMessageHandlerFactory> factory = new(MockBehavior.Strict);
+        DefaultMcpToolHandler handler = new(["example.com"], factory.Object, "workflow-mcp");
+        using CancellationTokenSource cancellation = new();
+        cancellation.Cancel();
+
+        // Act
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => handler.InvokeToolAsync(
+            "https://example.com/mcp", null, "ping", null, null, null, cancellation.Token));
+
+        // Assert
+        factory.Verify(f => f.CreateHandler(It.IsAny<string>()), Times.Never);
+    }
+
+    [Theory]
+    [InlineData("ping")]
+    [InlineData(DefaultMcpToolHandler.ListToolsToolName)]
+    public async Task InvokeToolAsync_WithoutAllowedHosts_ShouldRejectBeforeClientCreationAsync(string toolName)
+    {
+        // Arrange
+        Mock<IHttpMessageHandlerFactory> factory = new(MockBehavior.Strict);
+        DefaultMcpToolHandler handler = new([], factory.Object, "workflow-mcp");
+
+        // Act
+        HttpRequestException exception = await Assert.ThrowsAsync<HttpRequestException>(() => handler.InvokeToolAsync(
+            "https://example.com/mcp", null, toolName, null, null, null));
+
+        // Assert
+        Assert.Contains("allowed hosts", exception.Message);
+        factory.Verify(f => f.CreateHandler(It.IsAny<string>()), Times.Never);
+    }
+
+    [Theory]
+    [InlineData("https://other.example/mcp")]
+    [InlineData("https://sub.example.com/mcp")]
+    [InlineData("https://example.com.other.example/mcp")]
+    [InlineData("https://example.com:8443/mcp")]
+    [InlineData("http://example.com/mcp")]
+    [InlineData("https://example.com@other.example/mcp")]
+    public async Task InvokeToolAsync_WithUnlistedDestination_ShouldRejectBeforeClientCreationAsync(string serverUrl)
+    {
+        // Arrange
+        Mock<IHttpMessageHandlerFactory> factory = new(MockBehavior.Strict);
+        DefaultMcpToolHandler handler = new(["example.com"], factory.Object, "workflow-mcp");
+
+        // Act
+        HttpRequestException exception = await Assert.ThrowsAsync<HttpRequestException>(() => handler.InvokeToolAsync(
+            serverUrl, null, "ping", null, null, null));
+
+        // Assert
+        Assert.Contains("allowed hosts", exception.Message);
+        factory.Verify(f => f.CreateHandler(It.IsAny<string>()), Times.Never);
+    }
+
+    [Theory]
+    [InlineData("Host")]
+    [InlineData("hOsT")]
+    public async Task InvokeToolAsync_WithHostHeader_ShouldRejectBeforeClientCreationAsync(string headerName)
+    {
+        // Arrange
+        Mock<IHttpMessageHandlerFactory> factory = new(MockBehavior.Strict);
+        DefaultMcpToolHandler handler = new(["example.com"], factory.Object, "workflow-mcp");
+        Dictionary<string, string> headers = new() { [headerName] = "other.example" };
+
+        // Act
+        HttpRequestException exception = await Assert.ThrowsAsync<HttpRequestException>(() => handler.InvokeToolAsync(
+            "https://example.com/mcp", null, "ping", null, headers, null));
+
+        // Assert
+        Assert.Contains("Host header", exception.Message);
+        factory.Verify(f => f.CreateHandler(It.IsAny<string>()), Times.Never);
+    }
+
+    [Fact]
+    public void Constructor_WithNullAllowedHosts_ShouldThrow()
+    {
+        // Arrange
+        Mock<IHttpMessageHandlerFactory> factory = new();
+
+        // Act
+        ArgumentNullException exception = Assert.Throws<ArgumentNullException>(() =>
+            new DefaultMcpToolHandler(null!, factory.Object, "workflow-mcp"));
+
+        // Assert
+        Assert.Equal("allowedHosts", exception.ParamName);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData(" ")]
+    [InlineData("https://example.com")]
+    [InlineData("example.com/path")]
+    [InlineData("*.example.com")]
+    [InlineData("example.com:0")]
+    [InlineData("example.com:65536")]
+    [InlineData("example.com:invalid")]
+    public void Constructor_WithInvalidAllowedHost_ShouldThrow(string? allowedHost)
+    {
+        // Arrange
+        Mock<IHttpMessageHandlerFactory> factory = new();
+
+        // Act
+        ArgumentException exception = Assert.Throws<ArgumentException>(() =>
+            new DefaultMcpToolHandler([allowedHost!], factory.Object, "workflow-mcp"));
+
+        // Assert
+        Assert.Equal("allowedHosts", exception.ParamName);
+    }
+
+    #region Reserved Tools/List Tests
+
+    [Fact]
+    public void IsListToolsToolName_WithReservedName_ShouldReturnTrue()
+    {
+        // Act
+        bool result = DefaultMcpToolHandler.IsListToolsToolName(DefaultMcpToolHandler.ListToolsToolName);
+
+        // Assert
+        Assert.True(result);
+    }
+
+    [Fact]
+    public void IsListToolsToolName_WithRegularToolName_ShouldReturnFalse()
+    {
+        // Act
+        bool result = DefaultMcpToolHandler.IsListToolsToolName("search");
+
+        // Assert
+        Assert.False(result);
+    }
+
+    [Fact]
+    public async Task InvokeToolAsync_WithListToolsArguments_ShouldThrowArgumentExceptionAsync()
+    {
+        // Arrange
+        Mock<IHttpMessageHandlerFactory> factory = new(MockBehavior.Strict);
+        DefaultMcpToolHandler handler = new(["example.com"], factory.Object, "workflow-mcp");
+
+        // Act
+        ArgumentException exception = await Assert.ThrowsAsync<ArgumentException>(() => handler.InvokeToolAsync(
+            "https://example.com/mcp", "test", DefaultMcpToolHandler.ListToolsToolName,
+            new Dictionary<string, object?> { ["ignored"] = true }, null, null));
+
+        // Assert
+        Assert.Contains("does not accept tool arguments", exception.Message);
+        factory.Verify(f => f.CreateHandler(It.IsAny<string>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task CreateListToolsResultContent_WithTools_ShouldSerializeToolMetadataAsync()
+    {
+        // Arrange
+        JsonElement inputSchema = JsonSerializer.Deserialize<JsonElement>(
+            """
+            {
+              "type": "object",
+              "properties": {
+                "query": {
+                  "type": "string"
+                }
+              },
+              "required": [ "query" ]
+            }
+            """);
+        Tool tool = new()
+        {
+            Name = "search",
+            Description = "Searches documentation.",
+            InputSchema = inputSchema,
+            Annotations = new ToolAnnotations { ReadOnlyHint = true, DestructiveHint = false },
+            Meta = new JsonObject { ["revision"] = "initial" }
+        };
+
+        // Act
+        McpServerToolResultContent result = DefaultMcpToolHandler.CreateListToolsResultContent([tool]);
+
+        // Assert
+        TextContent text = Assert.IsType<TextContent>(Assert.Single(result.Outputs ?? []));
+        using JsonDocument document = JsonDocument.Parse(text.Text);
+        JsonElement listedTool = document.RootElement.GetProperty("tools")[0];
+        Assert.Equal("search", listedTool.GetProperty("name").GetString());
+        Assert.Equal("Searches documentation.", listedTool.GetProperty("description").GetString());
+        Assert.Equal("string", listedTool.GetProperty("inputSchema").GetProperty("properties").GetProperty("query").GetProperty("type").GetString());
+        Assert.True(listedTool.GetProperty("annotations").GetProperty("readOnlyHint").GetBoolean());
+        Assert.False(listedTool.GetProperty("annotations").GetProperty("destructiveHint").GetBoolean());
+        Assert.Equal("initial", listedTool.GetProperty("_meta").GetProperty("revision").GetString());
+
+        // Act
+        Assert.NotNull(tool.Annotations);
+        tool.Annotations.ReadOnlyHint = false;
+        McpServerToolResultContent updatedResult = DefaultMcpToolHandler.CreateListToolsResultContent([tool]);
+
+        // Assert
+        TextContent updatedText = Assert.IsType<TextContent>(Assert.Single(updatedResult.Outputs ?? []));
+        using JsonDocument updatedDocument = JsonDocument.Parse(updatedText.Text);
+        JsonElement updatedTool = updatedDocument.RootElement.GetProperty("tools")[0];
+        Assert.False(updatedTool.GetProperty("annotations").GetProperty("readOnlyHint").GetBoolean());
+        Assert.Equal(listedTool.GetProperty("inputSchema").GetRawText(), updatedTool.GetProperty("inputSchema").GetRawText());
+        Assert.Equal(listedTool.GetProperty("_meta").GetRawText(), updatedTool.GetProperty("_meta").GetRawText());
+    }
+
+    #endregion
+
+    #region ConvertContentBlock Tests
+
+    [Fact]
+    public void ConvertContentBlock_TextContentBlock_ShouldReturnTextContent()
+    {
+        // Arrange
+        TextContentBlock block = new() { Text = "hello world" };
+
+        // Act
+        AIContent result = DefaultMcpToolHandler.ConvertContentBlock(block);
+
+        // Assert
+        TextContent textContent = Assert.IsType<TextContent>(result);
+        Assert.Equal("hello world", textContent.Text);
+        Assert.Same(block, textContent.RawRepresentation);
+    }
+
+    [Fact]
+    public void ConvertContentBlock_ImageContentBlock_WithEmptyData_ShouldReturnDataContentWithEmptyUri()
+    {
+        // Arrange
+        ImageContentBlock block = new() { Data = ReadOnlyMemory<byte>.Empty, MimeType = "image/png" };
+
+        // Act
+        AIContent result = DefaultMcpToolHandler.ConvertContentBlock(block);
+
+        // Assert
+        DataContent dataContent = Assert.IsType<DataContent>(result);
+        Assert.Equal("image/png", dataContent.MediaType);
+        Assert.Equal("data:image/png;base64,", dataContent.Uri);
+        Assert.True(dataContent.Data.IsEmpty);
+        Assert.Same(block, dataContent.RawRepresentation);
+    }
+
+    [Fact]
+    public void ConvertContentBlock_ImageContentBlock_WithBase64Payload_ShouldReturnDataContent()
+    {
+        // Arrange
+        const string Base64Payload = "iVBORw0KGgo=";
+        byte[] base64Bytes = Encoding.UTF8.GetBytes(Base64Payload);
+        byte[] expectedDecoded = Convert.FromBase64String(Base64Payload);
+        ImageContentBlock block = new() { Data = new ReadOnlyMemory<byte>(base64Bytes), MimeType = "image/png" };
+
+        // Act
+        AIContent result = DefaultMcpToolHandler.ConvertContentBlock(block);
+
+        // Assert
+        DataContent dataContent = Assert.IsType<DataContent>(result);
+        Assert.Equal("image/png", dataContent.MediaType);
+        Assert.Equivalent(expectedDecoded, dataContent.Data.ToArray());
+        Assert.Equal($"data:image/png;base64,{Base64Payload}", dataContent.Uri);
+        Assert.Same(block, dataContent.RawRepresentation);
+    }
+
+    [Fact]
+    public void ConvertContentBlock_AudioContentBlock_WithEmptyData_ShouldReturnDataContentWithEmptyUri()
+    {
+        // Arrange
+        AudioContentBlock block = new() { Data = ReadOnlyMemory<byte>.Empty, MimeType = "audio/wav" };
+
+        // Act
+        AIContent result = DefaultMcpToolHandler.ConvertContentBlock(block);
+
+        // Assert
+        DataContent dataContent = Assert.IsType<DataContent>(result);
+        Assert.Equal("audio/wav", dataContent.MediaType);
+        Assert.Equal("data:audio/wav;base64,", dataContent.Uri);
+        Assert.True(dataContent.Data.IsEmpty);
+        Assert.Same(block, dataContent.RawRepresentation);
+    }
+
+    [Fact]
+    public void ConvertContentBlock_AudioContentBlock_WithBase64Payload_ShouldReturnDataContent()
+    {
+        // Arrange
+        const string Base64Payload = "UklGRiQA";
+        byte[] base64Bytes = Encoding.UTF8.GetBytes(Base64Payload);
+        byte[] expectedDecoded = Convert.FromBase64String(Base64Payload);
+        AudioContentBlock block = new() { Data = new ReadOnlyMemory<byte>(base64Bytes), MimeType = "audio/wav" };
+
+        // Act
+        AIContent result = DefaultMcpToolHandler.ConvertContentBlock(block);
+
+        // Assert
+        DataContent dataContent = Assert.IsType<DataContent>(result);
+        Assert.Equal("audio/wav", dataContent.MediaType);
+        Assert.Equivalent(expectedDecoded, dataContent.Data.ToArray());
+        Assert.Equal($"data:audio/wav;base64,{Base64Payload}", dataContent.Uri);
+        Assert.Same(block, dataContent.RawRepresentation);
+    }
+
+    [Fact]
+    public void ConvertContentBlock_EmbeddedResourceBlock_WithTextResource_ShouldReturnTextContent()
+    {
+        // Arrange
+        EmbeddedResourceBlock block = new()
+        {
+            Resource = new TextResourceContents
+            {
+                Text = "embedded text payload",
+                Uri = "resource://example",
+                MimeType = "text/plain",
+            },
+        };
+
+        // Act
+        AIContent result = DefaultMcpToolHandler.ConvertContentBlock(block);
+
+        // Assert
+        TextContent textContent = Assert.IsType<TextContent>(result);
+        Assert.Equal("embedded text payload", textContent.Text);
+        Assert.Same(block, textContent.RawRepresentation);
+    }
+
+    [Fact]
+    public void ConvertContentBlock_EmbeddedResourceBlock_WithBlobResource_ShouldReturnDataContent()
+    {
+        // Arrange
+        const string Base64Payload = "UklGRiQA";
+        byte[] base64Bytes = Encoding.UTF8.GetBytes(Base64Payload);
+        byte[] expectedDecoded = Convert.FromBase64String(Base64Payload);
+        EmbeddedResourceBlock block = new()
+        {
+            Resource = new BlobResourceContents
+            {
+                Blob = new ReadOnlyMemory<byte>(base64Bytes),
+                Uri = "resource://example.bin",
+                MimeType = "application/zip",
+            },
+        };
+
+        // Act
+        AIContent result = DefaultMcpToolHandler.ConvertContentBlock(block);
+
+        // Assert
+        DataContent dataContent = Assert.IsType<DataContent>(result);
+        Assert.Equal("application/zip", dataContent.MediaType);
+        Assert.Equivalent(expectedDecoded, dataContent.Data.ToArray());
+        Assert.Equal($"data:application/zip;base64,{Base64Payload}", dataContent.Uri);
+        Assert.Same(block, dataContent.RawRepresentation);
+    }
+
+    [Fact]
+    public void ConvertContentBlock_ResourceLinkBlock_WithUri_ShouldReturnUriContent()
+    {
+        // Arrange
+        ResourceLinkBlock block = new()
+        {
+            Uri = "https://example.com/resource.bin",
+            Name = "resource.bin",
+            MimeType = "application/zip",
+        };
+
+        // Act
+        AIContent result = DefaultMcpToolHandler.ConvertContentBlock(block);
+
+        // Assert
+        UriContent uriContent = Assert.IsType<UriContent>(result);
+        Assert.Equal("https://example.com/resource.bin", uriContent.Uri.ToString());
+        Assert.Equal("application/zip", uriContent.MediaType);
+        Assert.Same(block, uriContent.RawRepresentation);
+    }
+
+    [Fact]
+    public void ConvertContentBlock_ResourceLinkBlock_WithNullMimeType_ShouldDefaultToOctetStream()
+    {
+        // Arrange
+        ResourceLinkBlock block = new()
+        {
+            Uri = "https://example.com/resource",
+            Name = "resource",
+            MimeType = null,
+        };
+
+        // Act
+        AIContent result = DefaultMcpToolHandler.ConvertContentBlock(block);
+
+        // Assert
+        UriContent uriContent = Assert.IsType<UriContent>(result);
+        Assert.Equal("https://example.com/resource", uriContent.Uri.ToString());
+        Assert.Equal("application/octet-stream", uriContent.MediaType);
+    }
+
+    [Fact]
+    public void ConvertContentBlock_ResourceLinkBlock_WithMeta_ShouldPropagateToAdditionalProperties()
+    {
+        // Arrange
+        ResourceLinkBlock block = new()
+        {
+            Uri = "https://example.com/resource.bin",
+            Name = string.Empty,
+            MimeType = "application/zip",
+            Meta = new JsonObject
+            {
+                ["traceId"] = "abc-123",
+                ["priority"] = 7,
+            },
+        };
+
+        // Act
+        AIContent result = DefaultMcpToolHandler.ConvertContentBlock(block);
+
+        // Assert
+        UriContent uriContent = Assert.IsType<UriContent>(result);
+        Assert.NotNull(uriContent.AdditionalProperties);
+        Assert.Equal(2, uriContent.AdditionalProperties.Count);
+        Assert.Same(block.Meta!["traceId"], uriContent.AdditionalProperties["traceId"]);
+        Assert.Same(block.Meta["priority"], uriContent.AdditionalProperties["priority"]);
+    }
+
+    [Fact]
+    public void ConvertContentBlock_ResourceLinkBlock_WithName_ShouldMapNameToFilenameAdditionalProperty()
+    {
+        // Arrange
+        ResourceLinkBlock block = new()
+        {
+            Uri = "https://example.com/resource.bin",
+            Name = "resource.bin",
+            MimeType = "application/zip",
+        };
+
+        // Act
+        AIContent result = DefaultMcpToolHandler.ConvertContentBlock(block);
+
+        // Assert
+        UriContent uriContent = Assert.IsType<UriContent>(result);
+        Assert.NotNull(uriContent.AdditionalProperties);
+        Assert.Equal("resource.bin", uriContent.AdditionalProperties!["filename"]);
+    }
+
+#pragma warning disable MCP9005 // Verify compatibility mapping for deprecated sampling content blocks.
+    [Fact]
+    public void ConvertContentBlock_ToolUseContentBlock_ShouldReturnFunctionCallContent()
+    {
+        // Arrange
+        using JsonDocument input = JsonDocument.Parse("{\"city\":\"Seattle\",\"unit\":\"celsius\"}");
+        ToolUseContentBlock block = new()
+        {
+            Id = "call-1",
+            Name = "get_weather",
+            Input = input.RootElement.Clone(),
+        };
+
+        // Act
+        AIContent result = DefaultMcpToolHandler.ConvertContentBlock(block);
+
+        // Assert
+        FunctionCallContent call = Assert.IsType<FunctionCallContent>(result);
+        Assert.Equal("call-1", call.CallId);
+        Assert.Equal("get_weather", call.Name);
+        Assert.NotNull(call.Arguments);
+        Assert.Contains("city", call.Arguments!);
+        Assert.Same(block, call.RawRepresentation);
+    }
+
+    [Fact]
+    public void ConvertContentBlock_ToolResultContentBlock_NotError_ShouldReturnFunctionResultContent()
+    {
+        // Arrange
+        ToolResultContentBlock block = new()
+        {
+            ToolUseId = "call-1",
+            Content = [new TextContentBlock { Text = "ok" }],
+            IsError = false,
+        };
+
+        // Act
+        AIContent result = DefaultMcpToolHandler.ConvertContentBlock(block);
+
+        // Assert
+        FunctionResultContent functionResult = Assert.IsType<FunctionResultContent>(result);
+        Assert.Equal("call-1", functionResult.CallId);
+        Assert.Null(functionResult.Exception);
+        Assert.Same(block, functionResult.RawRepresentation);
+    }
+
+    [Fact]
+    public void ConvertContentBlock_ToolResultContentBlock_WithIsError_ShouldSetException()
+    {
+        // Arrange
+        ToolResultContentBlock block = new()
+        {
+            ToolUseId = "call-2",
+            Content = [new TextContentBlock { Text = "boom" }],
+            IsError = true,
+        };
+
+        // Act
+        AIContent result = DefaultMcpToolHandler.ConvertContentBlock(block);
+
+        // Assert
+        FunctionResultContent functionResult = Assert.IsType<FunctionResultContent>(result);
+        Assert.Equal("call-2", functionResult.CallId);
+        Assert.NotNull(functionResult.Exception);
+        Assert.Same(block, functionResult.RawRepresentation);
+    }
+#pragma warning restore MCP9005
+
+    [Fact]
+    public void ConvertContentBlock_BlockWithMeta_ShouldPropagateToAdditionalProperties()
+    {
+        // Arrange
+        TextContentBlock block = new()
+        {
+            Text = "hello",
+            Meta = new JsonObject
+            {
+                ["traceId"] = "abc-123",
+                ["priority"] = 7,
+            },
+        };
+
+        // Act
+        AIContent result = DefaultMcpToolHandler.ConvertContentBlock(block);
+
+        // Assert
+        Assert.NotNull(result.AdditionalProperties);
+        Assert.True(result.AdditionalProperties!.ContainsKey("traceId"));
+        Assert.True(result.AdditionalProperties.ContainsKey("priority"));
+    }
+
+    #endregion
+}

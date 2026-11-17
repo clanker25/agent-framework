@@ -1,0 +1,434 @@
+# Copyright (c) Microsoft. All rights reserved.
+
+from __future__ import annotations
+
+import inspect
+import os
+from typing import Any, cast
+from unittest.mock import AsyncMock, MagicMock
+
+import agent_framework._telemetry as telemetry
+import pytest
+from agent_framework import SecretString, SupportsGetEmbeddings
+from agent_framework._telemetry import get_feature_token
+from agent_framework.exceptions import IntegrationInvalidResponseException, SettingNotFoundError
+from openai.types import CreateEmbeddingResponse
+from openai.types import Embedding as OpenAIEmbedding
+from openai.types.create_embedding_response import Usage
+
+from agent_framework_openai import (
+    OpenAIEmbeddingClient,
+    OpenAIEmbeddingOptions,
+)
+from agent_framework_openai._embedding_client import RawOpenAIEmbeddingClient
+from agent_framework_openai._feature_usage import FeatureIndex
+
+
+def _make_openai_response(
+    embeddings: list[list[float]],
+    model: str = "text-embedding-3-small",
+    prompt_tokens: int = 5,
+    total_tokens: int = 5,
+) -> CreateEmbeddingResponse:
+    """Helper to create a mock OpenAI embeddings response."""
+    data = [OpenAIEmbedding(embedding=emb, index=i, object="embedding") for i, emb in enumerate(embeddings)]
+    return CreateEmbeddingResponse(
+        data=data,
+        model=model,
+        object="list",
+        usage=Usage(prompt_tokens=prompt_tokens, total_tokens=total_tokens),
+    )
+
+
+# --- OpenAI unit tests ---
+
+
+def test_openai_construction_with_explicit_params() -> None:
+    client = OpenAIEmbeddingClient(
+        model="text-embedding-3-small",
+        api_key="test-key",
+    )
+    assert client.model == "text-embedding-3-small"
+    assert isinstance(client, SupportsGetEmbeddings)
+
+
+def test_public_openai_embedding_client_accepts_secret_string() -> None:
+    client = OpenAIEmbeddingClient(
+        model="text-embedding-3-small",
+        api_key=SecretString("test-key"),
+    )
+
+    assert client.client is not None
+    assert type(client.client.api_key) is str
+    assert client.client.api_key == "test-key"
+
+
+def test_raw_openai_embedding_client_init_uses_explicit_parameters() -> None:
+    signature = inspect.signature(RawOpenAIEmbeddingClient.__init__)
+
+    assert "additional_properties" in signature.parameters
+    assert all(parameter.kind != inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values())
+
+
+def test_openai_construction_from_env(openai_unit_test_env: dict[str, str]) -> None:
+    client = OpenAIEmbeddingClient()
+    assert client.model == openai_unit_test_env["OPENAI_EMBEDDING_MODEL"]
+
+
+def test_with_callable_api_key() -> None:
+    """Test OpenAIEmbeddingClient initialization with callable API key."""
+
+    async def get_api_key() -> str:
+        return "test-api-key-123"
+
+    client = OpenAIEmbeddingClient(model="text-embedding-3-small", api_key=get_api_key)
+
+    assert client.model == "text-embedding-3-small"
+    assert client.client is not None
+
+
+@pytest.mark.parametrize("exclude_list", [["OPENAI_API_KEY"]], indirect=True)
+def test_openai_construction_without_openai_or_azure_config_raises_clear_error(
+    openai_unit_test_env: dict[str, str],
+) -> None:
+    with pytest.raises(SettingNotFoundError):
+        OpenAIEmbeddingClient(model="text-embedding-3-small")
+
+
+@pytest.mark.parametrize("exclude_list", [["OPENAI_EMBEDDING_MODEL"]], indirect=True)
+def test_openai_construction_falls_back_to_openai_model(openai_unit_test_env: dict[str, str]) -> None:
+    client = OpenAIEmbeddingClient()
+
+    assert client.model == openai_unit_test_env["OPENAI_MODEL"]
+
+
+async def test_openai_get_embeddings(openai_unit_test_env: dict[str, str]) -> None:
+    mock_response = _make_openai_response(
+        embeddings=[[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]],
+    )
+    client = OpenAIEmbeddingClient()
+    client.client = MagicMock()
+    client.client.embeddings = MagicMock()
+    client.client.embeddings.create = AsyncMock(return_value=mock_response)
+
+    result = await client.get_embeddings(["hello", "world"])
+
+    assert len(result) == 2
+    assert result[0].vector == [0.1, 0.2, 0.3]
+    assert result[1].vector == [0.4, 0.5, 0.6]
+    assert result[0].model == "text-embedding-3-small"
+    assert result[0].dimensions == 3
+
+
+async def test_openai_get_embeddings_honors_response_indexes(openai_unit_test_env: dict[str, str]) -> None:
+    mock_response = _make_openai_response(
+        embeddings=[[0.1, 0.2], [0.3, 0.4]],
+    )
+    mock_response.data.reverse()
+    client = OpenAIEmbeddingClient()
+    client.client = MagicMock()
+    client.client.embeddings = MagicMock()
+    client.client.embeddings.create = AsyncMock(return_value=mock_response)
+
+    result = await client.get_embeddings(["first", "second"])
+
+    assert [embedding.vector for embedding in result] == [[0.1, 0.2], [0.3, 0.4]]
+
+
+async def test_embedding_request_marks_openai_feature(
+    openai_unit_test_env: dict[str, str],
+) -> None:
+    mock_response = _make_openai_response(embeddings=[[0.1]])
+    client = OpenAIEmbeddingClient()
+    client.client = MagicMock()
+    client.client.embeddings = MagicMock()
+    client.client.embeddings.create = AsyncMock(return_value=mock_response)
+    with telemetry._feature_mask_lock:
+        telemetry._feature_mask = 0
+
+    await client.get_embeddings(["test"])
+
+    token = get_feature_token()
+    assert token is not None
+    assert int(token.split(".", 1)[1], 16) & (1 << FeatureIndex.OPENAI)
+
+
+async def test_openai_get_embeddings_usage(openai_unit_test_env: dict[str, str]) -> None:
+    mock_response = _make_openai_response(
+        embeddings=[[0.1]],
+        prompt_tokens=10,
+        total_tokens=10,
+    )
+    client = OpenAIEmbeddingClient()
+    client.client = MagicMock()
+    client.client.embeddings = MagicMock()
+    client.client.embeddings.create = AsyncMock(return_value=mock_response)
+
+    result = await client.get_embeddings(["test"])
+
+    assert result.usage is not None
+    assert result.usage["input_token_count"] == 10
+    assert result.usage["total_token_count"] == 10
+
+
+async def test_openai_options_passthrough_dimensions(openai_unit_test_env: dict[str, str]) -> None:
+    mock_response = _make_openai_response(embeddings=[[0.1]])
+    client = OpenAIEmbeddingClient()
+    client.client = MagicMock()
+    client.client.embeddings = MagicMock()
+    client.client.embeddings.create = AsyncMock(return_value=mock_response)
+
+    options: OpenAIEmbeddingOptions = {"dimensions": 256}
+    result = await client.get_embeddings(["test"], options=options)
+
+    call_kwargs = client.client.embeddings.create.call_args[1]
+    assert call_kwargs["dimensions"] == 256
+    assert result.options is options
+
+
+async def test_openai_options_passthrough_encoding_format(openai_unit_test_env: dict[str, str]) -> None:
+    mock_response = _make_openai_response(embeddings=[[0.1]])
+    client = OpenAIEmbeddingClient()
+    client.client = MagicMock()
+    client.client.embeddings = MagicMock()
+    client.client.embeddings.create = AsyncMock(return_value=mock_response)
+
+    options: OpenAIEmbeddingOptions = {"encoding_format": "base64"}
+    await client.get_embeddings(["test"], options=options)
+
+    call_kwargs = client.client.embeddings.create.call_args[1]
+    assert call_kwargs["encoding_format"] == "base64"
+
+
+async def test_openai_does_not_forward_unknown_options(openai_unit_test_env: dict[str, str]) -> None:
+    client = OpenAIEmbeddingClient()
+    client.client = MagicMock()
+    client.client.embeddings = MagicMock()
+    client.client.embeddings.create = AsyncMock(return_value=_make_openai_response(embeddings=[[0.1]]))
+
+    await client.get_embeddings(["test"], options=cast(Any, {"input_type": "query"}))
+
+    call_kwargs = client.client.embeddings.create.call_args[1]
+    assert set(call_kwargs) == {"input", "model"}
+
+
+async def test_subclass_extra_request_options_are_forwarded(openai_unit_test_env: dict[str, str]) -> None:
+    class CompatibleEmbeddingClient(OpenAIEmbeddingClient):
+        def _prepare_extra_request_options(self, options: Any) -> dict[str, Any]:
+            return {"extra_body": {"input_type": options["input_type"]}}
+
+    client = CompatibleEmbeddingClient()
+    client.client = MagicMock()
+    client.client.embeddings = MagicMock()
+    client.client.embeddings.create = AsyncMock(return_value=_make_openai_response(embeddings=[[0.1]]))
+
+    await client.get_embeddings(["test"], options=cast(Any, {"input_type": "query", "dimensions": 8}))
+
+    call_kwargs = client.client.embeddings.create.call_args[1]
+    assert call_kwargs["extra_body"] == {"input_type": "query"}
+    assert call_kwargs["dimensions"] == 8
+
+
+async def test_rejected_extra_request_options_send_nothing(openai_unit_test_env: dict[str, str]) -> None:
+    class CompatibleEmbeddingClient(OpenAIEmbeddingClient):
+        def _prepare_extra_request_options(self, options: Any) -> dict[str, Any]:
+            raise ValueError("unsupported option")
+
+    client = CompatibleEmbeddingClient()
+    client.client = MagicMock()
+    client.client.embeddings = MagicMock()
+    client.client.embeddings.create = AsyncMock(return_value=_make_openai_response(embeddings=[[0.1]]))
+    with telemetry._feature_mask_lock:
+        telemetry._feature_mask = 0
+
+    with pytest.raises(ValueError, match="unsupported option"):
+        await client.get_embeddings(["test"])
+
+    client.client.embeddings.create.assert_not_awaited()
+    assert get_feature_token() is None
+
+
+async def test_openai_base64_decoding(openai_unit_test_env: dict[str, str]) -> None:
+    import base64
+    import struct
+
+    # Encode [0.1, 0.2, 0.3] as base64 little-endian floats
+    raw_floats = [0.1, 0.2, 0.3]
+    b64_str = base64.b64encode(struct.pack(f"<{len(raw_floats)}f", *raw_floats)).decode()
+
+    # Mock the embedding item to return a base64 string (as the API does with encoding_format=base64)
+    mock_item = MagicMock()
+    mock_item.embedding = b64_str
+    mock_item.index = 0
+
+    mock_response = MagicMock()
+    mock_response.data = [mock_item]
+    mock_response.model = "text-embedding-3-small"
+    mock_response.usage = MagicMock(prompt_tokens=3, total_tokens=3)
+
+    client = OpenAIEmbeddingClient()
+    client.client = MagicMock()
+    client.client.embeddings = MagicMock()
+    client.client.embeddings.create = AsyncMock(return_value=mock_response)
+
+    options: OpenAIEmbeddingOptions = {"encoding_format": "base64"}
+    result = await client.get_embeddings(["test"], options=options)
+
+    assert len(result) == 1
+    assert len(result[0].vector) == 3
+    assert result[0].dimensions == 3
+    for expected, actual in zip(raw_floats, result[0].vector):
+        assert abs(expected - actual) < 1e-6
+
+
+async def test_openai_base64_misaligned_payload_raises_descriptive_error(openai_unit_test_env: dict[str, str]) -> None:
+    """A truncated base64 payload must fail with a clear error naming the input index,
+    not a bare struct buffer-size error."""
+    import base64
+    import struct
+
+    # Input 0 is well formed; input 1 is one float (4 bytes) plus a stray byte, so it
+    # decodes to 5 bytes. The response lists them in reverse order to make sure the
+    # diagnostic reports the item's own index rather than its position in the list.
+    aligned = base64.b64encode(struct.pack("<1f", 0.25)).decode()
+    misaligned = base64.b64encode(struct.pack("<1f", 0.5) + b"\x00").decode()
+
+    good_item = MagicMock()
+    good_item.embedding = aligned
+    good_item.index = 0
+
+    bad_item = MagicMock()
+    bad_item.embedding = misaligned
+    bad_item.index = 1
+
+    mock_response = MagicMock()
+    mock_response.data = [bad_item, good_item]
+    mock_response.model = "text-embedding-3-small"
+    mock_response.usage = MagicMock(prompt_tokens=6, total_tokens=6)
+
+    client = OpenAIEmbeddingClient()
+    client.client = MagicMock()
+    client.client.embeddings = MagicMock()
+    client.client.embeddings.create = AsyncMock(return_value=mock_response)
+
+    options: OpenAIEmbeddingOptions = {"encoding_format": "base64"}
+
+    with pytest.raises(ValueError) as exc_info:
+        await client.get_embeddings(["first", "second"], options=options)
+
+    message = str(exc_info.value)
+    assert "input index 1" in message
+    assert "decoded to 5 bytes" in message
+    assert "cannot be split into 4-byte little-endian floats" in message
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param("!!!not-base64!!!", id="invalid-characters"),
+        pytest.param("\u00e9", id="non-ascii"),
+    ],
+)
+async def test_openai_base64_decoding_rejects_undecodable_payload(
+    payload: str,
+    openai_unit_test_env: dict[str, str],
+) -> None:
+    """A payload that cannot be decoded must name the input rather than raise binascii.Error."""
+    mock_item = MagicMock()
+    mock_item.embedding = payload
+    mock_item.index = 1
+
+    mock_response = MagicMock()
+    mock_response.data = [mock_item]
+    mock_response.model = "text-embedding-3-small"
+    mock_response.usage = MagicMock(prompt_tokens=3, total_tokens=3)
+
+    client = OpenAIEmbeddingClient()
+    client.client = MagicMock()
+    client.client.embeddings = MagicMock()
+    client.client.embeddings.create = AsyncMock(return_value=mock_response)
+
+    with pytest.raises(IntegrationInvalidResponseException, match="input index 1") as exc_info:
+        await client.get_embeddings(["test"], options={"encoding_format": "base64"})
+
+    assert exc_info.value.__cause__ is not None
+
+
+async def test_openai_error_when_no_model() -> None:
+    client = cast(Any, object.__new__(OpenAIEmbeddingClient))
+    client.model = None
+    client.client = MagicMock()
+    client.additional_properties = {}
+    client.otel_provider_name = "openai"
+
+    with pytest.raises(ValueError, match="model is required"):
+        await client.get_embeddings(["test"])
+
+
+async def test_openai_empty_values_returns_empty(openai_unit_test_env: dict[str, str]) -> None:
+    client = OpenAIEmbeddingClient()
+    client.client = MagicMock()
+    client.client.embeddings = MagicMock()
+    client.client.embeddings.create = AsyncMock()
+
+    result = await client.get_embeddings([])
+
+    assert len(result) == 0
+    assert result.usage is None
+    client.client.embeddings.create.assert_not_called()
+
+
+# --- Integration tests ---
+
+skip_if_openai_integration_tests_disabled = pytest.mark.skipif(
+    os.getenv("OPENAI_API_KEY", "") in ("", "test-dummy-key"),
+    reason="No real OPENAI_API_KEY provided; skipping integration tests.",
+)
+
+
+@skip_if_openai_integration_tests_disabled
+@pytest.mark.flaky
+@pytest.mark.integration
+async def test_integration_openai_get_embeddings() -> None:
+    """End-to-end test of OpenAI embedding generation."""
+    client = OpenAIEmbeddingClient(model="text-embedding-3-small")
+
+    result = await client.get_embeddings(["hello world"])
+
+    assert len(result) == 1
+    assert isinstance(result[0].vector, list)
+    assert len(result[0].vector) > 0
+    assert all(isinstance(v, float) for v in result[0].vector)
+    assert result[0].model is not None
+    assert result.usage is not None
+    input_token_count = result.usage["input_token_count"]
+    assert input_token_count is not None
+    assert input_token_count > 0
+
+
+@skip_if_openai_integration_tests_disabled
+@pytest.mark.flaky
+@pytest.mark.integration
+async def test_integration_openai_get_embeddings_multiple() -> None:
+    """Test embedding generation for multiple inputs."""
+    client = OpenAIEmbeddingClient(model="text-embedding-3-small")
+
+    result = await client.get_embeddings(["hello", "world", "test"])
+
+    assert len(result) == 3
+    dims = [len(e.vector) for e in result]
+    assert all(d == dims[0] for d in dims)
+
+
+@skip_if_openai_integration_tests_disabled
+@pytest.mark.flaky
+@pytest.mark.integration
+async def test_integration_openai_get_embeddings_with_dimensions() -> None:
+    """Test embedding generation with custom dimensions."""
+    client = OpenAIEmbeddingClient(model="text-embedding-3-small")
+
+    options: OpenAIEmbeddingOptions = {"dimensions": 256}
+    result = await client.get_embeddings(["hello world"], options=options)
+
+    assert len(result) == 1
+    assert len(result[0].vector) == 256

@@ -1,0 +1,178 @@
+# FIDES security samples
+
+This folder contains runnable FIDES samples. Keep this README as the quick
+entry point for choosing and running a sample; use
+[FIDES_DEVELOPER_GUIDE.md](FIDES_DEVELOPER_GUIDE.md) for the architecture,
+security model, middleware behavior, and API reference.
+
+## What each sample demonstrates
+
+| Sample | Focus | Demonstrates |
+|--------|-------|--------------|
+| `email_security_example.py` | Prompt injection defense | `SecureAgentConfig`, Foundry-backed email handling, `quarantined_llm`, and approval on policy violations |
+| `repo_confidentiality_example.py` | Data exfiltration prevention | Confidentiality labels, Foundry-backed repository access, `max_allowed_confidentiality`, and approval before leaking private data |
+| `user_identity_security_example.py` | Principal-bound identity data | Canonical tenant/user principals, identity-scoped sources and destinations, and allowed versus blocked flows |
+| `github_mcp_example.py` | Remote MCP URL with local FIDES enforcement | `SecureMCPToolProxy(url=...)`, IFC policy selection, secured MCP tools and Skills, and post-result policy enforcement |
+| `provider_message_labeling_example.py` | Central provider-message labeling | `SecureAgentConfig.message_labeler` classifies messages from existing history, memory, and context providers |
+
+## Prerequisites
+
+Run these samples from the `python/` directory with the repo development
+environment available.
+
+- Azure CLI authentication: `az login`
+- `FOUNDRY_PROJECT_ENDPOINT` set in your environment
+- `FOUNDRY_MODEL` set in your environment for the main agent deployment
+- Local dev environment installed (for example, `uv sync --dev`)
+
+These samples use Foundry for the main agent and keep the quarantine
+client pinned to `gpt-4o-mini` where applicable.
+
+For `github_mcp_example.py`, set:
+
+- `GITHUB_PAT` (GitHub Personal Access Token)
+- `FOUNDRY_PROJECT_ENDPOINT` (Foundry project endpoint)
+- `FOUNDRY_MODEL` (optional model override)
+
+## Suppressing the experimental warning
+
+The FIDES APIs in these samples are still experimental. Each sample includes a
+short commented `warnings.filterwarnings(...)` snippet near the imports.
+Uncomment it if you want to suppress the FIDES warning before using the
+experimental APIs locally.
+
+## Running the samples
+
+### `email_security_example.py`
+
+This sample simulates an inbox containing trusted and untrusted emails,
+including prompt-injection attempts that try to force a privileged `send_email`
+tool call.
+
+Run it with:
+
+```bash
+uv run samples/02-agents/security/email_security_example.py --cli
+uv run samples/02-agents/security/email_security_example.py --devui
+uv run samples/02-agents/security/email_security_example.py --cli --debug
+```
+
+When you run the DevUI variant, the sample prints the active DevUI bearer token
+before starting the server.
+
+Add `--debug` to enable verbose tool and security middleware logging.
+
+What to look for:
+
+- Untrusted email bodies are handled through the FIDES security flow
+- `quarantined_llm` processes hidden content in isolation
+- DevUI requests approval if the agent tries a blocked privileged action
+
+### `repo_confidentiality_example.py`
+
+This sample simulates a public issue that tries to trick the agent into reading
+private repository secrets and posting them to a public channel.
+
+Run it with:
+
+```bash
+uv run samples/02-agents/security/repo_confidentiality_example.py --cli
+uv run samples/02-agents/security/repo_confidentiality_example.py --devui
+```
+
+When you run the DevUI variant, the sample prints the active DevUI bearer token
+before starting the server.
+
+What to look for:
+
+- Reading public content keeps the context public
+- Reading private content taints the context as private
+- Posting private data to a public destination triggers an approval request
+
+### `user_identity_security_example.py`
+
+This sample creates source and destination tools from a host-authenticated
+tenant/user principal. It demonstrates the canonical principal metadata format
+and wires policy enforcement with `SecureAgentConfig`.
+
+Run it with:
+
+```bash
+uv run samples/02-agents/security/user_identity_security_example.py
+```
+
+What to look for:
+
+- Data read for Alice carries Alice's tenant/user principal
+- Saving that data to Alice's destination is allowed
+- Sending the same data to Bob's destination is blocked and audited
+- Principal identity comes from host configuration, not model tool arguments
+
+### `github_mcp_example.py`
+
+This sample connects directly to `https://api.githubcopilot.com/mcp/` through
+`MCPStreamableHTTPTool`, then wraps the MCP client in `SecureMCPToolProxy` so
+FIDES middleware can inspect tool results and enforce policy locally. The
+`X-MCP-Features: ifc_labels` header is passed to opt in to server-side IFC label
+emission in result `_meta`. The same proxy supplies
+`SkillsProvider(secure_github.skills_source())`, so MCP Skills resource reads
+use the same IFC policy. Servers without `skill://index.json` contribute no
+skills.
+
+Run it with:
+
+```bash
+uv run samples/02-agents/security/github_mcp_example.py --cli
+uv run samples/02-agents/security/github_mcp_example.py --cli --attack
+uv run samples/02-agents/security/github_mcp_example.py --devui
+uv run samples/02-agents/security/github_mcp_example.py --devui --debug
+```
+
+What to look for:
+
+- MCP tools are auto-labeled from remote annotations
+- MCP Skills retain per-read IFC labels through `secure_github.skills_source()`
+- `server_ifc_policy="restrict"` lets server IFC add restrictions without relaxing local policy
+- Untrusted tool output is tracked by FIDES label middleware
+- Attack-mode write attempts can trigger policy enforcement or approval
+
+### `provider_message_labeling_example.py`
+
+This sample configures one `SecureAgentConfig.message_labeler` for three existing
+framework providers:
+
+- `InMemoryHistoryProvider`
+- `FileMemoryProvider`
+- `TodoProvider`
+
+`SecureAgentConfig` is the final context provider, so its labeler sees messages
+from every provider it classifies.
+
+The callback receives each provider's authoritative `source_id`. It applies
+a trusted private label to application-owned history, an untrusted private
+label to file memory, and an untrusted public label to todo content.
+
+Run it with:
+
+```bash
+uv run samples/02-agents/security/provider_message_labeling_example.py
+```
+
+What to look for:
+
+- The sample defines no custom provider class
+- `SecureAgentConfig` is registered after the providers whose messages it classifies
+- The callback prints classifications for history, memory, and todo messages
+- FIDES does not mutate or stamp provider messages
+
+## Where to find the details
+
+For the full FIDES design and API details, see
+[FIDES_DEVELOPER_GUIDE.md](FIDES_DEVELOPER_GUIDE.md), which covers:
+
+- integrity and confidentiality labels
+- label propagation and auto-hiding behavior
+- policy enforcement middleware
+- security tools such as `quarantined_llm` and `inspect_variable`
+- `SecureAgentConfig` and manual integration patterns
+- history and context provider trust boundaries
